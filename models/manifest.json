@@ -1,4 +1,43 @@
 {
   "schema": 1,
-  "models": []
+  "models": [
+    {
+      "id": "gigaam-v3-e2e_rnnt",
+      "name": "GigaAM-v3 e2e_rnnt",
+      "repo": "https://huggingface.co/ai-sage/GigaAM-v3",
+      "revision": "e2e_rnnt",
+      "license": "MIT",
+      "files": [
+        {
+          "quant": "f16",
+          "url": "https://github.com/Nikita-prog-art/NPA_asr_app/releases/download/models-v3-e2e_rnnt/gigaam-v3-e2e_rnnt-f16.gguf",
+          "size": 448765536,
+          "sha256": "196a1f547e00e4d68d3f39c0f9e5dbcb2eb9ed5c239e65678f895309ff550686",
+          "params": 222519937
+        },
+        {
+          "quant": "q8_0",
+          "url": "https://github.com/Nikita-prog-art/NPA_asr_app/releases/download/models-v3-e2e_rnnt/gigaam-v3-e2e_rnnt-q8_0.gguf",
+          "size": 271818336,
+          "sha256": "192641b1da55fe7ae1c40147052803d7b0ae63370d8693982637f91a5ea56af0",
+          "params": 222519937
+        },
+        {
+          "quant": "q5_0",
+          "url": "https://github.com/Nikita-prog-art/NPA_asr_app/releases/download/models-v3-e2e_rnnt/gigaam-v3-e2e_rnnt-q5_0.gguf",
+          "size": 201039456,
+          "sha256": "704916214c82a17f52050a4258a30aebd7b827129689e08d894c1d7958976f16",
+          "params": 222519937
+        },
+        {
+          "quant": "q4_0",
+          "url": "https://github.com/Nikita-prog-art/NPA_asr_app/releases/download/models-v3-e2e_rnnt/gigaam-v3-e2e_rnnt-q4_0.gguf",
+          "size": 177446496,
+          "sha256": "863c0cc552941786665ff4c30fb98da27f453b908fbb85c63448c00b093c2c66",
+          "params": 222519937,
+          "recommended": true
+        }
+      ]
+    }
+  ]
 }
