@@ -32,6 +32,7 @@
 #include "imgui_impl_opengl3.h"
 #include <GLFW/glfw3.h>
 
+#include "app/build_info.h"
 #include "app/controller.h"
 #include "app/install.h"
 #include "app/models.h"
@@ -744,7 +745,7 @@ void draw_main_panel(GuiState & ui, Controller & controller, GLFWwindow * window
 
     ImGui::TextColored(accent_color(ui.settings.dark_theme), "NPA ASR");
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", ASR_VERSION);
+    ImGui::TextDisabled("%s · %s", ASR_VERSION, build_id());
     ImGui::Separator();
 
     // ---- status line
@@ -882,6 +883,11 @@ void draw_main_panel(GuiState & ui, Controller & controller, GLFWwindow * window
     if (at_bottom || st.recording) ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
 }
+
+// Defined with the rest of the install UI below; the settings tab shows it at
+// the bottom (installing is a per-user setting, not a separate screen).
+void draw_install_section(GuiState & ui);
+void text_dim_wrapped(const std::string & text);
 
 void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * window,
                        const AppStatus & st) {
@@ -1028,6 +1034,14 @@ void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * wind
     } else {
         ImGui::TextDisabled("применяются автоматически");
     }
+
+    // ---- install / autostart: the settings the application keeps for this user
+    ImGui::SeparatorText("Установка приложения");
+    draw_install_section(ui);
+    text_dim_wrapped("Установка — это копирование этого файла в личный каталог (права "
+                     "администратора не нужны); настройки и модели остаются на месте.");
+    text_dim_wrapped("Командная строка: npa_asr --install | --autostart on|off | "
+                     "--install-status | --uninstall");
 }
 
 void draw_models_tab(GuiState & ui, Controller & controller) {
@@ -1197,7 +1211,8 @@ void run_install(GuiState & ui, bool autostart, bool autostart_only) {
         refresh_install_status(ui);
         ui.install_error.clear();
         ui.install_message = autostart_only ? "автозагрузка включена"
-                                            : "установлено: " + ui.install.install_exe;
+                                            : "установлено: " + ui.install.install_exe +
+                                                  " (сборка " + build_id() + ")";
     } else {
         ui.install_error = err;
     }
@@ -1236,15 +1251,23 @@ void text_dim_wrapped(const std::string & text) {
 void draw_install_section(GuiState & ui) {
     if (!ui.install_checked) refresh_install_status(ui);
     const InstallStatus & st = ui.install;
+    const bool update = install_update_pending(st);
 
     if (st.running_installed) {
-        ImGui::TextWrapped("Приложение запущено из установленной копии.");
+        ImGui::TextWrapped("Приложение запущено из установленной копии (сборка %s).", build_id());
     } else if (st.installed && st.up_to_date) {
-        ImGui::TextWrapped("Установленная копия совпадает с запущенной.");
+        ImGui::TextWrapped("Установленная копия совпадает с запущенной (сборка %s).", build_id());
+    } else if (update) {
+        ImGui::TextWrapped("Установлена копия другой сборки (%s), запущена %s — её можно обновить.",
+                           st.installed_build_id.empty() ? "без метки" : st.installed_build_id.c_str(),
+                           build_id());
     } else if (st.installed) {
-        ImGui::TextWrapped("Установленная копия есть, но отличается от запущенной.");
+        ImGui::TextWrapped("Установленная копия — та же сборка (%s), но файл отличается "
+                           "(пересборка без изменений в коде).",
+                           build_id());
     } else {
-        ImGui::TextWrapped("Приложение не установлено, запускается из текущего файла.");
+        ImGui::TextWrapped("Приложение не установлено, запускается из текущего файла (сборка %s).",
+                           build_id());
     }
     text_dim_wrapped("Каталог установки: " + st.install_dir);
     if (!st.detail.empty()) text_dim_wrapped(st.detail);
@@ -1255,17 +1278,22 @@ void draw_install_section(GuiState & ui) {
     }
     text_dim_wrapped("Автозапуск: " + st.autostart_target);
 
+    // The primary action owns its line: with the longer labels ("Обновить
+    // установленную копию") the buttons do not fit side by side in the panel.
     if (!st.running_installed) {
-        if (ImGui::Button(st.installed ? "Обновить установленную копию" : "Установить в систему")) {
-            run_install(ui, false, false);
-        }
-        ImGui::SameLine();
-    }
-    if (st.installed && !st.running_installed) {
-        if (ImGui::Button("Удалить установленную копию")) run_uninstall(ui);
+        const char * label = !st.installed ? "Установить в систему"
+                                           : (update ? "Обновить установленную копию"
+                                                     : "Переустановить");
+        if (ImGui::Button(label)) run_install(ui, false, false);
         ImGui::SameLine();
     }
     if (ImGui::Button("Проверить")) refresh_install_status(ui);
+    if (st.installed && !st.running_installed) {
+        if (ImGui::Button("Удалить копию")) run_uninstall(ui);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Удалить автозапуск и установленный файл;\nнастройки и модели останутся");
+        }
+    }
 
     if (!ui.install_message.empty()) {
         ImGui::PushStyleColor(ImGuiCol_Text, accent_color(ui.settings.dark_theme));
@@ -1279,7 +1307,8 @@ void draw_install_section(GuiState & ui) {
     }
 }
 
-// Shown once, on the first run of a copy that is not installed yet.
+// Offered on the first run of a copy that is not installed yet, and once for
+// every new source revision afterwards.
 void draw_install_popup(GuiState & ui) {
     if (!ui.install_offer) return;
 
@@ -1290,6 +1319,7 @@ void draw_install_popup(GuiState & ui) {
         ui.install_popup_opened = true;
     }
 
+    const bool update = install_update_pending(ui.install);
     const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(560.0f * ui.ui_scale, 0.0f), ImGuiCond_Appearing);
@@ -1297,7 +1327,15 @@ void draw_install_popup(GuiState & ui) {
         return;
     }
 
-    ImGui::TextWrapped("Скопировать приложение в личную папку пользователя и запускать его при входе в систему?");
+    if (update) {
+        ImGui::TextWrapped("Установлена копия сборки %s. Заменить её этой сборкой (%s)?",
+                           ui.install.installed_build_id.empty()
+                               ? "без метки"
+                               : ui.install.installed_build_id.c_str(),
+                           build_id());
+    } else {
+        ImGui::TextWrapped("Скопировать приложение в личную папку пользователя и запускать его при входе в систему?");
+    }
     ImGui::Spacing();
     ImGui::BulletText("Программа: %s", ui.install.install_exe.c_str());
     ImGui::BulletText("Настройки и модели остаются в %s", platform::user_data_dir().c_str());
@@ -1310,13 +1348,13 @@ void draw_install_popup(GuiState & ui) {
     }
 
     ImGui::Spacing();
-    if (ImGui::Button("Установить", ImVec2(160.0f * ui.ui_scale, 0.0f))) {
+    if (ImGui::Button(update ? "Обновить" : "Установить", ImVec2(160.0f * ui.ui_scale, 0.0f))) {
         run_install(ui, ui.install_autostart, false);
         ui.install_offer = false;
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Позже", ImVec2(120.0f * ui.ui_scale, 0.0f))) {
+    if (ImGui::Button(update ? "Позже" : "Не сейчас", ImVec2(120.0f * ui.ui_scale, 0.0f))) {
         mark_install_prompt_shown();
         ui.install_offer = false;
         ImGui::CloseCurrentPopup();
@@ -1338,7 +1376,7 @@ void draw_about_tab(GuiState & ui) {
     }
 
     ImGui::SeparatorText("NPA ASR");
-    ImGui::Text("Версия: %s", ASR_VERSION);
+    ImGui::Text("Версия: %s   ·   сборка %s", ASR_VERSION, build_id());
     ImGui::TextWrapped(
         "Офлайн-распознавание русской речи (GigaAM-v3 e2e_rnct на ggml): "
         "push-to-talk, потоковое распознавание и вставка текста в активное окно.");
@@ -1352,9 +1390,6 @@ void draw_about_tab(GuiState & ui) {
     ImGui::SeparatorText("Файлы");
     ImGui::TextWrapped("Настройки: %s", Settings::settings_path().c_str());
     ImGui::TextWrapped("Каталог моделей: %s", ui.models_dir.c_str());
-
-    ImGui::SeparatorText("Установка");
-    draw_install_section(ui);
 
     ImGui::SeparatorText("Модель и лицензия");
     if (ImGui::Button("Открыть страницу GigaAM-v3")) {
@@ -1429,11 +1464,26 @@ void update_interface_scale(GuiState & ui, GLFWwindow * window) {
     ui.theme_applied = true;
 }
 
+// Each tab scrolls on its own.  Without this the whole panel scrolls - the tab
+// strip included - as soon as a tab is taller than the window, and the tabs
+// disappear from view while scrolling.
+void begin_tab_body(const char * id) {
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::BeginChild(id, ImVec2(0.0f, 0.0f));
+    ImGui::PopStyleVar();
+}
+
+void end_tab_body() { ImGui::EndChild(); }
+
 void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
 
     const AppStatus st = controller.status();  // one snapshot per frame
 
     for (const std::string & message : controller.take_log()) ui.log_lines.push_back(message);
+
+    // The install state is read once (it hashes two executables) and the
+    // settings tab works off this snapshot; the actions refresh it.
+    if (!ui.install_checked) refresh_install_status(ui);
 
     // debounced apply_settings(): sliders and combos may change every frame
     if (ui.settings_dirty && (now_seconds() - ui.settings_changed_at) > 0.4) {
@@ -1473,19 +1523,27 @@ void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
     ImGui::BeginChild("tabs_panel", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders);
     if (ImGui::BeginTabBar("asr_tabs", ImGuiTabBarFlags_None)) {
         if (ImGui::BeginTabItem("Настройки")) {
+            begin_tab_body("settings_body");
             draw_settings_tab(ui, controller, window, st);
+            end_tab_body();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Модели")) {
+            begin_tab_body("models_body");
             draw_models_tab(ui, controller);
+            end_tab_body();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Журнал")) {
+            begin_tab_body("log_body");
             draw_log_tab(ui);
+            end_tab_body();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("О программе")) {
+        if (ImGui::BeginTabItem("О сборке")) {
+            begin_tab_body("about_body");
             draw_about_tab(ui);
+            end_tab_body();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
@@ -1543,7 +1601,10 @@ int run_gui(bool minimized) {
 #endif
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-    GLFWwindow * window = glfwCreateWindow(1040, 720, "NPA ASR", nullptr, nullptr);
+    // The revision in the title bar makes it obvious which build is on screen.
+    const std::string window_title =
+        std::string("NPA ASR ") + ASR_VERSION + " (" + build_id() + ")";
+    GLFWwindow * window = glfwCreateWindow(1040, 720, window_title.c_str(), nullptr, nullptr);
     if (window == nullptr) {
         const char * description = nullptr;
         glfwGetError(&description);
@@ -1623,8 +1684,8 @@ int run_gui(bool minimized) {
     std::snprintf(ui.path_buf, sizeof(ui.path_buf), "%s", ui.settings.model_path.c_str());
     std::snprintf(ui.hotkey_buf, sizeof(ui.hotkey_buf), "%s", ui.settings.hotkey.c_str());
 
-    // Offer to install the application once, on the first run of a copy that was
-    // not started from the install directory.
+    // Offer to install (or, for a build with a different source revision, to
+    // update) the per-user copy once - see should_offer_install().
     ui.install_offer = should_offer_install();
 
     if (minimized) glfwIconifyWindow(window);  // the autostart entry starts this way
