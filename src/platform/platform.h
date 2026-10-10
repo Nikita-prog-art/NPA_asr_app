@@ -64,6 +64,8 @@ bool inject_text(const std::string & utf8);
 // ------------------------------------------------------------------ misc
 
 std::string exe_dir();
+// Full path of the running executable ("" when it cannot be determined).
+std::string exe_path();
 std::string home_dir();
 // Per-user writable directory for models/settings
 // (Linux: $XDG_DATA_HOME/npa_asr or ~/.local/share/npa_asr,

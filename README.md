@@ -297,3 +297,50 @@ python -m venv .venv && .venv/bin/pip install torch --index-url https://download
 * [Dear ImGui](https://github.com/ocornut/imgui) (MIT) + [GLFW](https://www.glfw.org/) (zlib) — интерфейс;
 * [nlohmann/json](https://github.com/nlohmann/json) (MIT) — настройки и манифест;
 * [oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) — FFT (опционально).
+
+---
+
+## Установка и автозапуск
+
+Приложение собирается в один самодостаточный исполняемый файл, поэтому
+«установка» — это копирование его в пользовательский каталог и, по желанию,
+регистрация в автозапуске. Настройки и модели при установке, удалении и
+переключении автозапуска не трогаются: они всегда остаются в каталоге
+пользовательских данных (`~/.local/share/npa_asr` в Linux,
+`%LOCALAPPDATA%\npa_asr` в Windows).
+
+Пути установки:
+
+* **Windows**: `%LOCALAPPDATA%\Programs\NPA ASR\npa_asr.exe`;
+  * автозапуск — раздел реестра
+    `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, значение `NPA ASR`
+    с данными `"<каталог установки>\npa_asr.exe" --minimized`.
+* **Linux**: `~/.local/bin/npa_asr`;
+  * автозапуск — `~/.config/autostart/npa-asr.desktop`;
+  * пункт меню — `~/.local/share/applications/npa-asr.desktop`.
+
+Флаги командной строки (работают без графического окружения; при ошибке
+возвращается ненулевой код):
+
+| Флаг | Действие |
+| --- | --- |
+| `--install` | скопировать приложение в каталог установки и включить автозапуск |
+| `--install-only` | скопировать приложение без автозапуска |
+| `--uninstall` | удалить автозапуск и установленные файлы (настройки и модели остаются) |
+| `--uninstall-keep-files` | удалить только автозапуск, установленные файлы оставить |
+| `--autostart on\|off` | включить или выключить автозапуск, не трогая установленную копию |
+| `--install-status` | показать состояние: путь установки, актуальность копии, автозапуск |
+
+```bash
+npa_asr --install                 # копия в ~/.local/bin + автозапуск
+npa_asr --install-only            # только копия
+npa_asr --install-status          # что и где установлено
+npa_asr --autostart off           # выключить автозапуск
+npa_asr --uninstall               # удалить автозапуск и файлы
+```
+
+Чтобы команда `npa_asr` была доступна из терминала, каталог `~/.local/bin`
+должен присутствовать в `PATH`; `--install-status` предупредит, если это не
+так. Запуск установленной копии равносилен обычному запуску: повторная
+установка поверх работающего процесса не выполняется (в Windows файл занят),
+вместо этого выводится понятная ошибка.
