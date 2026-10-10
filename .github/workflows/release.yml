@@ -20,7 +20,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   ASR_DEPS_KEY: ggml-ffa4e8b80930029a35991f94e7c8a93cd67730ab-imgui-v1.92.9b-glfw-3.4-miniaudio-0.11.25-json-v3.11.3
@@ -46,7 +46,19 @@ jobs:
             suffix: windows-x86_64
 
     steps:
+      # A manual run must build the commit the tag points at, not the branch it
+      # was dispatched from.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Check the release tag
+        shell: bash
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "::error::release tag must look like v1.2.3, got '$RELEASE_TAG'"; exit 1 ;;
+          esac
 
       - name: Cache fetched third-party sources
         uses: actions/cache@v4
@@ -65,10 +77,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
+            ninja-build libcurl4-openssl-dev \
+            libx11-dev libxext-dev libxi-dev libxtst-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev \
+            libgl1-mesa-dev
 
+      # The version baked into the binary comes from the tag, so a release can
+      # never ship a binary that reports a different version than its name.
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DASR_TOOLS=OFF
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DASR_TOOLS=OFF \
+            -DASR_CPU_ARCH=x86-64-v3 \
+            -DASR_VERSION="${RELEASE_TAG#v}"
 
       - name: Build
         if: runner.os == 'Linux'
@@ -85,7 +107,9 @@ jobs:
         run: |
           ./build/bin/npa_asr --help
           ./build/bin/npa_asr --info
-          ./build/bin/npa_asr --list-models || true
+          ./build/bin/npa_asr --info | grep -q "compiled for: x86-64-v3"
+          ./build/bin/npa_asr --info | grep -q "npa_asr ${RELEASE_TAG#v}"
+          ./build/bin/npa_asr --list-models || [ $? -le 1 ]
 
       - name: Smoke test
         if: runner.os == 'Windows'
@@ -93,10 +117,12 @@ jobs:
         run: |
           build\bin\npa_asr.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          build\bin\npa_asr.exe --info
+          $info = build\bin\npa_asr.exe --info | Out-String
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # exits non-zero when the runner has no local models: not a failure
+          if ($info -notmatch 'compiled for: x86-64-v3') { throw 'unexpected CPU baseline in --info' }
+          if ($info -notmatch [regex]::Escape("npa_asr $($env:RELEASE_TAG -replace '^v','')")) { throw 'binary version does not match the tag' }
           build\bin\npa_asr.exe --list-models
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
           exit 0
 
       - name: Add "npa_asr --info" to the job summary
@@ -121,7 +147,6 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $info
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
-          exit 0
 
       - name: Stage the release asset
         if: runner.os == 'Linux'
@@ -153,6 +178,8 @@ jobs:
     name: Publish the GitHub release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download the release assets
         uses: actions/download-artifact@v4

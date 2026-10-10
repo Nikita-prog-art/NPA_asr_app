@@ -1,12 +1,14 @@
 name: Convert GigaAM-v3 e2e_rnnt to GGUF
 
-# One-off (or on-demand) job: downloads the PyTorch checkpoint from Hugging Face,
-# converts it to GGUF in several quantization levels and publishes them as
-# release assets, together with models/manifest.json which the application reads
-# to offer downloads.  The manifest is also committed back to the repository.
+# One-off job: downloads the PyTorch checkpoint from Hugging Face, converts it to
+# GGUF in several quantization levels and publishes them as release assets,
+# together with models/manifest.json which the application reads to offer
+# downloads.  The manifest is also committed back to the repository.
 #
-# Run it from the Actions tab (workflow_dispatch) or push a tag matching
-# "models-*".
+# It only ever needs to run once (or again if the upstream checkpoint changes or
+# a new quantization level is wanted): start it manually from the Actions tab.
+# It is deliberately not triggered by a push, so a normal commit can never kick
+# off a 500 MB model conversion.
 
 on:
   workflow_dispatch:
@@ -19,9 +21,6 @@ on:
         description: 'Release tag the assets are published to'
         default: 'models-v3-e2e_rnnt'
         required: true
-  push:
-    tags:
-      - 'models-*'
 
 permissions:
   contents: write

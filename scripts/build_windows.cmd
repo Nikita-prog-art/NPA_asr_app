@@ -28,17 +28,23 @@ if defined VSPATH (
 
 set "ARCH_ARG="
 if not "%ASR_CPU_ARCH%"=="" set "ARCH_ARG=-DASR_CPU_ARCH=%ASR_CPU_ARCH%"
-if /I not "%ASR_NATIVE%"=="OFF" set "ARCH_ARG=-DASR_NATIVE=ON"
+rem ASR_NATIVE is unset by default, so only treat it as ON when it is defined
+rem and not "OFF" - otherwise an unset variable would enable native builds.
+if defined ASR_NATIVE if /I not "%ASR_NATIVE%"=="OFF" set "ARCH_ARG=-DASR_NATIVE=ON"
 
 rem One ggml CPU backend is compiled for a fixed ISA baseline, so a job needs
 rem roughly 1 GB; budget 2 GB per job anyway so a memory-limited machine does
 rem not get swapped to death.  ASR_JOBS overrides the heuristic.
+rem NOTE: inside a parenthesised block %VAR% is expanded when the block is
+rem parsed, so the values set inside it must be read with !VAR! (delayed
+rem expansion is enabled above) - otherwise cmd.exe fails with
+rem "1 was unexpected at this time".
 set "JOBS=%ASR_JOBS%"
-if "%JOBS%"=="" (
+if not defined JOBS (
     for /f %%m in ('powershell -NoProfile -Command "[math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)" 2^>nul') do set "RAM_GB=%%m"
     if not defined RAM_GB set "RAM_GB=8"
-    set /a JOBS=%RAM_GB%/2
-    if %JOBS% LSS 1 set "JOBS=1"
+    set /a JOBS=!RAM_GB!/2
+    if !JOBS! LSS 1 set "JOBS=1"
 )
 echo [build] parallel jobs: %JOBS%
 
@@ -52,6 +58,13 @@ if errorlevel 1 goto :fail
 
 cmake --build "%BUILD_DIR%" -j %JOBS%
 if errorlevel 1 goto :fail
+
+rem ninja/cmake do not always surface a failed link through errorlevel, so the
+rem result is verified independently before claiming success.
+if not exist "%BUILD_DIR%\bin\npa_asr.exe" (
+    echo [build] FAILED: %BUILD_DIR%\bin\npa_asr.exe was not produced
+    exit /b 1
+)
 
 echo.
 echo [build] done: %BUILD_DIR%\bin\npa_asr.exe

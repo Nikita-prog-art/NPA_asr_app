@@ -1,0 +1,5 @@
+// Windows application manifest (DPI awareness, supported OS versions,
+// asInvoker).  Configured so that the manifest path is absolute: the resource
+// compiler resolves relative paths against its own working directory.
+// CREATEPROCESS_MANIFEST_RESOURCE_ID (1), RT_MANIFEST (24).
+1 24 "@CMAKE_CURRENT_SOURCE_DIR@/cmake/npa_asr.manifest"

@@ -14,8 +14,22 @@ set(ASR_GLFW_TAG   3.4)
 set(ASR_MINI_TAG   0.11.25)
 set(ASR_JSON_TAG   v3.11.3)
 
+# asr_need_dir(<var> <path> <url> [<probe-file>])
+#
+# A directory counts as populated when it contains a known file.  The default
+# probe is CMakeLists.txt, which is right for ggml and glfw but wrong for imgui:
+# it ships no CMakeLists.txt, so a cache-restored third_party/imgui used to be
+# re-fetched, and FetchContent would extract into a non-empty SOURCE_DIR.
 function(asr_need_dir var path url)
-  if(EXISTS "${path}/CMakeLists.txt" OR EXISTS "${path}/CMakeLists.txt.in")
+  set(probe "${ARGV3}")
+  if(NOT probe)
+    set(probe "CMakeLists.txt")
+  endif()
+  if(EXISTS "${path}/${probe}")
+    set(${var} "${path}" PARENT_SCOPE)
+    return()
+  endif()
+  if(EXISTS "${path}/CMakeLists.txt.in")
     set(${var} "${path}" PARENT_SCOPE)
     return()
   endif()
@@ -25,6 +39,9 @@ function(asr_need_dir var path url)
   message(STATUS "fetching ${url} -> ${path}")
   FetchContent_Declare(${var}_src URL ${url} SOURCE_DIR ${path})
   FetchContent_Populate(${var}_src)
+  if(NOT EXISTS "${path}/${probe}")
+    message(FATAL_ERROR "fetched ${url} but ${path}/${probe} is still missing")
+  endif()
   set(${var} "${path}" PARENT_SCOPE)
 endfunction()
 
@@ -58,7 +75,8 @@ asr_need_file(${CMAKE_SOURCE_DIR}/third_party/json.hpp
 # ---- GUI -------------------------------------------------------------------
 if(ASR_GUI)
   asr_need_dir(ASR_IMGUI_DIR ${CMAKE_SOURCE_DIR}/third_party/imgui
-    https://github.com/ocornut/imgui/archive/refs/tags/${ASR_IMGUI_TAG}.tar.gz)
+    https://github.com/ocornut/imgui/archive/refs/tags/${ASR_IMGUI_TAG}.tar.gz
+    imgui.cpp)
   asr_need_dir(ASR_GLFW_DIR ${CMAKE_SOURCE_DIR}/third_party/glfw
     https://github.com/glfw/glfw/archive/refs/tags/${ASR_GLFW_TAG}.tar.gz)
 
@@ -67,8 +85,7 @@ if(ASR_GUI)
   set(GLFW_BUILD_DOCS     OFF CACHE BOOL "" FORCE)
   set(GLFW_INSTALL        OFF CACHE BOOL "" FORCE)
   set(GLFW_BUILD_WAYLAND  OFF CACHE BOOL "" FORCE)
-  # ggml needs BUILD_SHARED_LIBS=ON for its runtime-dispatched CPU backends, and
-  # that would otherwise turn GLFW into glfw3.dll/libglfw.so - force static so
+  # The whole project is linked statically, so GLFW is a static library too and
   # the application has no extra runtime dependency.
   set(GLFW_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
   add_subdirectory(${ASR_GLFW_DIR} ${CMAKE_BINARY_DIR}/glfw EXCLUDE_FROM_ALL)
@@ -78,5 +95,11 @@ if(ASR_GUI)
     set_target_properties(glfw PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    # third-party code: keep our global -Wall/-Wextra out of its output
+    if(MSVC)
+      target_compile_options(glfw PRIVATE /w)
+    else()
+      target_compile_options(glfw PRIVATE -w)
+    endif()
   endif()
 endif()

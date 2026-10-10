@@ -11,14 +11,13 @@ name: Build
 # users: it would bake in the ISA extensions of the GitHub runner CPU.
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
+  # On demand only: releases are built by release.yml (push of a v* tag), and
+  # this workflow is the manual smoke build for a branch or a pull request.
   workflow_dispatch:
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 env:
   # Pinned third-party versions from cmake/deps.cmake.  Together with the runner
@@ -66,10 +65,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
+            ninja-build libcurl4-openssl-dev \
+            libx11-dev libxext-dev libxi-dev libxtst-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev \
+            libgl1-mesa-dev
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DASR_CPU_ARCH=x86-64-v3
 
       - name: Build
         if: runner.os == 'Linux'
@@ -86,7 +88,10 @@ jobs:
         run: |
           ./build/bin/npa_asr --help
           ./build/bin/npa_asr --info
-          ./build/bin/npa_asr --list-models || true
+          # the artifact must carry the portable baseline, not the runner's CPU
+          ./build/bin/npa_asr --info | grep -q "compiled for: x86-64-v3"
+          # exits 1 when there are no local models; anything above that is a crash
+          ./build/bin/npa_asr --list-models || [ $? -le 1 ]
 
       - name: Smoke test
         if: runner.os == 'Windows'
@@ -94,10 +99,12 @@ jobs:
         run: |
           build\bin\npa_asr.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          build\bin\npa_asr.exe --info
+          $info = build\bin\npa_asr.exe --info | Out-String
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # exits non-zero when the runner has no local models: not a failure
+          if ($info -notmatch 'compiled for: x86-64-v3') { throw 'unexpected CPU baseline in --info' }
+          # exits 1 when there are no local models; anything above that is a crash
           build\bin\npa_asr.exe --list-models
+          if ($LASTEXITCODE -gt 1) { exit $LASTEXITCODE }
           exit 0
 
       - name: Add "npa_asr --info" to the job summary
@@ -122,7 +129,6 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $info
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
-          exit 0
 
       # The build output is one self-contained executable, nothing else.
       - name: Upload the executable

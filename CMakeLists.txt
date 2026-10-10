@@ -27,6 +27,10 @@ endif()
 option(ASR_GUI     "build the ImGui desktop GUI"                ON)
 option(ASR_TOOLS   "build test/benchmark tools"                 ON)
 option(ASR_FETCH_DEPS "download missing third-party sources at configure time" ON)
+# libcurl pulls in a large part of a Linux userland (openssl, gnutls, krb5, ldap,
+# ...).  With -DASR_LIBCURL=OFF the downloader spawns the `curl`/`wget` command
+# line tool instead and the executable depends on X11/OpenGL/libc only.
+option(ASR_LIBCURL "use libcurl for model downloads on Linux" ON)
 # ggml's own thread pool is used by default; OpenMP adds a runtime dependency
 # (libgomp.so / vcomp140.dll) and measured no faster, so it stays off.
 option(ASR_OPENMP  "let ggml use OpenMP (adds a libgomp/vcomp runtime dependency)" OFF)
@@ -131,6 +135,18 @@ set(GGML_AVX512           OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
 
+# ggml is third-party code compiled with our global -Wall/-Wextra; silence it so
+# that real warnings in src/ remain visible in the build output.
+foreach(ggml_target ggml ggml-base ggml-cpu)
+  if(TARGET ${ggml_target})
+    if(MSVC)
+      target_compile_options(${ggml_target} PRIVATE /w)
+    else()
+      target_compile_options(${ggml_target} PRIVATE -w)
+    endif()
+  endif()
+endforeach()
+
 # ---------------------------------------------------------------- asr core
 file(GLOB_RECURSE ASR_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/core/*.cpp
@@ -154,11 +170,15 @@ find_package(Threads REQUIRED)
 target_link_libraries(asr_core PUBLIC Threads::Threads)
 
 # libcurl (optional) - used by the Linux downloader when the headers exist.
-find_package(CURL QUIET)
-if(CURL_FOUND)
-  message(STATUS "libcurl found: ${CURL_VERSION_STRING}")
-  target_compile_definitions(asr_core PUBLIC ASR_HAVE_LIBCURL=1)
-  target_link_libraries(asr_core PUBLIC CURL::libcurl)
+if(ASR_LIBCURL)
+  find_package(CURL QUIET)
+  if(CURL_FOUND)
+    message(STATUS "libcurl found: ${CURL_VERSION_STRING}")
+    target_compile_definitions(asr_core PUBLIC ASR_HAVE_LIBCURL=1)
+    target_link_libraries(asr_core PUBLIC CURL::libcurl)
+  else()
+    message(STATUS "libcurl not found: downloads will spawn curl/wget")
+  endif()
 endif()
 
 # X11 / XTest / XRecord (Linux only)
@@ -213,6 +233,21 @@ if(APPLE)
 endif()
 if(WIN32)
   target_link_libraries(npa_asr PRIVATE winhttp shlwapi ws2_32)
+  # Application manifest: Per-Monitor-V2 DPI awareness (a statically linked GLFW
+  # cannot carry its own manifest), long path support, asInvoker.
+  if(MSVC)
+    # The linker already emits a default manifest (/MANIFEST:EMBED,ID=1), so ours
+    # is merged into it with /MANIFESTINPUT.  Adding it as a resource instead
+    # fails with CVT1100 "duplicate resource, type MANIFEST, name 1".
+    target_link_options(npa_asr PRIVATE
+      "/MANIFEST:EMBED"
+      "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.manifest")
+  else()
+    # MinGW and friends: windres embeds it as resource id 1.
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.rc.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc @ONLY)
+    target_sources(npa_asr PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc)
+  endif()
 endif()
 
 set_target_properties(npa_asr PROPERTIES
