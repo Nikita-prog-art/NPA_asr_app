@@ -111,6 +111,13 @@ bool parse_file(const json & f, ModelFile * out, const std::string & where, std:
     if (!normalise_sha256(out->sha256, &out->sha256, where, err)) return false;
     if (!opt_u64(f, "size", &out->size, where, err)) return false;
     if (!opt_u64(f, "params", &out->params, where, err)) return false;
+    if (f.contains("recommended") && !f["recommended"].is_null()) {
+        if (!f["recommended"].is_boolean()) {
+            *err = where + ": field \"recommended\" must be true or false";
+            return false;
+        }
+        out->recommended = f["recommended"].get<bool>();
+    }
     return true;
 }
 

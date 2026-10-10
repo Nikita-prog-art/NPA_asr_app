@@ -66,6 +66,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+__pycache__/
+*.pyc
 
 # --- npa_asr ---
 # build trees

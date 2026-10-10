@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -46,7 +47,7 @@ void usage() {
         "options:\n"
         "  -m, --model PATH     path to the .gguf model\n"
         "  -i, --input PATH     audio file (wav/mp3/flac/ogg)\n"
-        "  -t, --threads N      worker threads (default: all cores)\n"
+        "  -t, --threads N      worker threads (default: half of the logical cores)\n"
         "      --step SEC       streaming re-encode interval (default 1.0)\n"
         "      --window SEC     sliding window length (default 20)\n"
         "      --models-dir DIR model directory (default: user data dir/models)\n"
@@ -123,11 +124,16 @@ int cmd_info() {
     std::printf("build   : %s\n", build_id());
     std::printf("os      : %s\n", platform::os_name().c_str());
     std::printf("cpu     : %s\n", platform::cpu_brand().c_str());
-    std::printf("threads : %u\n", std::thread::hardware_concurrency());
+    std::printf("threads : %u logical, auto uses %d\n", std::thread::hardware_concurrency(),
+                default_n_threads());
     std::printf("data dir: %s\n", platform::user_data_dir().c_str());
     std::printf("models  : %s\n", default_models_dir().c_str());
     std::printf("ggml devices: %s\n", backend_summary().c_str());
     std::printf("mel FFT : %s\n", fft_backend_name().c_str());
+    {
+        const std::unique_ptr<platform::TrayIcon> tray = platform::create_tray_icon();
+        std::printf("tray    : %s\n", tray->backend_name());
+    }
     return 0;
 }
 
@@ -230,7 +236,7 @@ int cmd_transcribe(const Args & a) {
     }
     RecognizerConfig cfg;
     cfg.model_path = a.model;
-    cfg.n_threads = a.threads;
+    cfg.n_threads = a.threads > 0 ? a.threads : default_n_threads();
     cfg.step_sec = a.step;
     cfg.max_window_sec = a.window;
     Recognizer rec;
@@ -385,7 +391,7 @@ int cmd_install_status() {
 int cmd_record(const Args & a) {
     RecognizerConfig cfg;
     cfg.model_path = a.model;
-    cfg.n_threads = a.threads;
+    cfg.n_threads = a.threads > 0 ? a.threads : default_n_threads();
     cfg.step_sec = a.step;
     cfg.max_window_sec = a.window;
     Recognizer rec;

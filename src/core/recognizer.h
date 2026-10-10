@@ -22,9 +22,16 @@
 
 namespace asr {
 
+// Worker threads used when a configuration leaves n_threads at 0 ("auto"):
+// half of the logical processors, at least one.  ggml's thread pool busy-waits
+// in its barriers, so one worker per logical processor oversubscribes hybrid
+// P/E-core CPUs and the encoder can stall for minutes under a power limit;
+// half of the logical processors still keeps every core busy.
+int default_n_threads();
+
 struct RecognizerConfig {
     std::string model_path;
-    int n_threads = 0;              // 0 = hardware concurrency
+    int n_threads = 0;              // 0 = default_n_threads()
 
     // streaming
     float min_window_sec = 0.5f;    // do not run the encoder before this

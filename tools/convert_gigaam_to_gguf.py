@@ -213,7 +213,12 @@ def convert(model_dir: Path, out: Path, quant: str) -> dict:
             w.add_tensor(name, arr)
         elif quant != "f16" and is_quantizable(name, arr):
             qarr = quantize(arr, qtype)
-            w.add_tensor(name, qarr.view(np.uint8), raw_shape=arr.shape, raw_dtype=qtype)
+            # `raw_shape` is NOT the element shape: gguf-py takes it as the shape
+            # of the *quantized bytes* and converts it back to elements itself
+            # (quant_shape_from_byte_shape).  Passing the element shape here makes
+            # gguf-py read the row length as a byte count and abort with
+            # "bytes per row (768) is not a multiple of Q8_0 type size (34)".
+            w.add_tensor(name, qarr.view(np.uint8), raw_dtype=qtype)
             n_quant += 1
         else:
             w.add_tensor(name, arr.astype(np.float16))
@@ -238,6 +243,48 @@ def convert(model_dir: Path, out: Path, quant: str) -> dict:
     return info
 
 
+def update_manifest(path: Path, quant: str, info: dict, release_base: str,
+                    recommend: bool) -> None:
+    """Adds/updates this quantization in the catalogue the application reads.
+
+    Kept separate from main() so the manifest logic can be exercised without
+    running the (slow) conversion.
+    """
+    manifest = {"schema": 1, "models": []}
+    if path.exists():
+        manifest = json.loads(path.read_text())
+    entry = next((m for m in manifest["models"] if m["id"] == "gigaam-v3-e2e_rnnt"), None)
+    if entry is None:
+        entry = {
+            "id": "gigaam-v3-e2e_rnnt",
+            "name": "GigaAM-v3 e2e_rnnt",
+            "repo": "https://huggingface.co/ai-sage/GigaAM-v3",
+            "revision": "e2e_rnnt",
+            "license": "MIT",
+            "files": [],
+        }
+        manifest["models"].append(entry)
+    entry["files"] = [f for f in entry["files"] if f["quant"] != quant]
+    if recommend:
+        # Only one quantization is suggested, so the mark moves with the flag.
+        for f in entry["files"]:
+            f.pop("recommended", None)
+    entry["files"].append(
+        {
+            "quant": quant,
+            "url": f"{release_base.rstrip('/')}/{info['file']}" if release_base else info["file"],
+            "size": info["size"],
+            "sha256": info["sha256"],
+            "params": info["params"],
+            **({"recommended": True} if recommend else {}),
+        }
+    )
+    entry["files"].sort(key=lambda f: -f["size"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    print(f"[convert] manifest -> {path}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", type=Path, default=Path("models/hf/gigaam-v3-e2e_rnnt"))
@@ -246,6 +293,9 @@ def main() -> int:
     ap.add_argument("--list-tensors", action="store_true")
     ap.add_argument("--manifest", type=Path, help="write/update a JSON manifest entry")
     ap.add_argument("--release-base", default="", help="URL prefix for the download link")
+    ap.add_argument("--recommend", action="store_true",
+                    help="mark this quantization as the suggested one in the manifest "
+                         "(clears the mark from the other quantizations of the model)")
     args = ap.parse_args()
 
     if args.list_tensors:
@@ -260,37 +310,7 @@ def main() -> int:
     info = convert(args.model_dir, out, args.quant)
 
     if args.manifest:
-        manifest = {"schema": 1, "models": []}
-        if args.manifest.exists():
-            manifest = json.loads(args.manifest.read_text())
-        entry = next(
-            (m for m in manifest["models"] if m["id"] == "gigaam-v3-e2e_rnnt"),
-            None,
-        )
-        if entry is None:
-            entry = {
-                "id": "gigaam-v3-e2e_rnnt",
-                "name": "GigaAM-v3 e2e_rnnt",
-                "repo": "https://huggingface.co/ai-sage/GigaAM-v3",
-                "revision": "e2e_rnnt",
-                "license": "MIT",
-                "files": [],
-            }
-            manifest["models"].append(entry)
-        entry["files"] = [f for f in entry["files"] if f["quant"] != args.quant]
-        entry["files"].append(
-            {
-                "quant": args.quant,
-                "url": f"{args.release_base.rstrip('/')}/{out.name}" if args.release_base else out.name,
-                "size": info["size"],
-                "sha256": info["sha256"],
-                "params": info["params"],
-            }
-        )
-        entry["files"].sort(key=lambda f: -f["size"])
-        args.manifest.parent.mkdir(parents=True, exist_ok=True)
-        args.manifest.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-        print(f"[convert] manifest -> {args.manifest}")
+        update_manifest(args.manifest, args.quant, info, args.release_base, args.recommend)
     return 0
 
 

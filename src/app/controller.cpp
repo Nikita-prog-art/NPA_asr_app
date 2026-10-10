@@ -35,10 +35,7 @@ std::vector<std::string> Controller::take_log() {
 
 bool Controller::init(const Settings & s, std::string * err) {
     settings_ = s;
-    if (settings_.n_threads <= 0) {
-        settings_.n_threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (settings_.n_threads <= 0) settings_.n_threads = 4;
-    }
+    if (settings_.n_threads <= 0) settings_.n_threads = default_n_threads();
 
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -172,10 +169,7 @@ void Controller::apply_settings(const Settings & s) {
     const bool device_changed = s.audio_device != settings_.audio_device;
     const bool threads_changed = s.n_threads != settings_.n_threads;
     settings_ = s;
-    if (settings_.n_threads <= 0) {
-        settings_.n_threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (settings_.n_threads <= 0) settings_.n_threads = 4;
-    }
+    if (settings_.n_threads <= 0) settings_.n_threads = default_n_threads();
     if (recognizer_ && (threads_changed || s.step_sec != settings_.step_sec)) {
         recognizer_->set_n_threads(settings_.n_threads);
         RecognizerConfig cfg;

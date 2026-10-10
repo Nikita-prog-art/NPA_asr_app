@@ -14,6 +14,9 @@ struct ModelFile {
     std::string sha256;   // lower-case hex, may be empty
     uint64_t size = 0;    // bytes, 0 when unknown
     uint64_t params = 0;  // parameter count, 0 when unknown
+    // The quantization the catalogue suggests when the user has no preference;
+    // the conversion workflow marks one file per model.
+    bool recommended = false;
 };
 
 struct ModelEntry {

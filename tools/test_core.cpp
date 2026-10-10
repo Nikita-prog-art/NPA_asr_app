@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <fstream>
 #include <thread>
 #include <string>
 #include <vector>
@@ -22,6 +23,7 @@ static int usage() {
                  "       asr_test fft <N>\n"
                  "       asr_test conv1d\n"
                  "       asr_test run <model.gguf> <golden.bin> [threads]\n"
+                 "       asr_test batch <model.gguf> <list.txt> [threads]\n"
                  "       asr_test bench <model.gguf> <audio.wav> [threads] [iters]\n");
     return 2;
 }
@@ -446,6 +448,59 @@ static int test_fft(int n) {
     return maxe < 1e-3 ? 0 : 1;
 }
 
+// Transcribes a list of audio files with one loaded model and prints
+// "<path>\t<text>" per line.  Loading the model costs more than a short
+// utterance, so a quality comparison across models has to batch: this is what
+// the quantization study uses, and it keeps the listening test to one load.
+static int test_batch(const std::string & model_path, const std::string & list_path, int threads) {
+    std::ifstream list(list_path);
+    if (!list) {
+        std::fprintf(stderr, "cannot read list %s\n", list_path.c_str());
+        return 1;
+    }
+    RecognizerConfig cfg;
+    cfg.model_path = model_path;
+    cfg.n_threads = threads;
+    Recognizer rec;
+    std::string err;
+    if (!rec.init(cfg, &err)) {
+        std::fprintf(stderr, "recognizer init: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "batch: %s, %d threads\n", rec.hp().model_name.c_str(), rec.n_threads());
+
+    std::string line;
+    int n_files = 0;
+    int n_failed = 0;
+    double audio_sec = 0.0;
+    double infer_ms = 0.0;
+    while (std::getline(list, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        std::vector<float> pcm;
+        if (!audio::load_file(line, 16000, pcm, &err)) {
+            std::fprintf(stderr, "skip %s: %s\n", line.c_str(), err.c_str());
+            ++n_failed;
+            continue;
+        }
+        Transcription tr;
+        if (!rec.transcribe(pcm.data(), static_cast<int>(pcm.size()), &tr, &err)) {
+            std::fprintf(stderr, "skip %s: %s\n", line.c_str(), err.c_str());
+            ++n_failed;
+            continue;
+        }
+        std::string text;
+        for (char c : tr.text) text += (c == '\t' || c == '\n') ? ' ' : c;
+        std::printf("%s\t%s\n", line.c_str(), text.c_str());
+        audio_sec += tr.audio_sec;
+        infer_ms += tr.infer_ms;
+        ++n_files;
+    }
+    std::fprintf(stderr, "batch: %d files (%.1f s audio) in %.1f s, %d failed\n", n_files, audio_sec,
+                 infer_ms / 1000.0, n_failed);
+    return n_files > 0 ? 0 : 1;
+}
+
 // Timing benchmark: mel front-end, encoder and the whole pipeline, for every
 // available FFT back-end.
 static int test_bench(const std::string & model_path, const std::string & wav_path, int threads,
@@ -458,7 +513,7 @@ static int test_bench(const std::string & model_path, const std::string & wav_pa
     }
     const double audio_sec = double(pcm.size()) / 16000.0;
     std::printf("bench: %.2f s of audio, %d threads, %d iterations\n", audio_sec,
-                threads > 0 ? threads : (int) std::thread::hardware_concurrency(), iters);
+                threads > 0 ? threads : default_n_threads(), iters);
 
     // A single FFT implementation now (the built-in Bluestein): this used to
     // loop over "oneMKL" and "internal".
@@ -518,6 +573,8 @@ int main(int argc, char ** argv) {
     if (cmd == "fft" && argc >= 3) return test_fft(std::atoi(argv[2]));
     if (cmd == "conv1d") return test_conv1d();
     if (cmd == "run" && argc >= 4) return test_run(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 0);
+    if (cmd == "batch" && argc >= 4)
+        return test_batch(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 0);
     if (cmd == "bench" && argc >= 4)
         return test_bench(argv[2], argv[3], argc >= 5 ? std::atoi(argv[4]) : 0,
                           argc >= 6 ? std::atoi(argv[5]) : 5);

@@ -16,7 +16,7 @@ OutputMode output_mode_from_name(const std::string & s);
 
 struct Settings {
     std::string model_path;              // path to the .gguf
-    int n_threads = 0;                   // 0 = hardware concurrency
+    int n_threads = 0;                   // 0 = auto (core's default_n_threads())
     std::string hotkey = "Ctrl+Alt+Space";
     bool dark_theme = true;
     int audio_device = -1;               // -1 = system default

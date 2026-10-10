@@ -268,7 +268,8 @@ if(APPLE)
     "-framework Cocoa" "-framework IOKit")
 endif()
 if(WIN32)
-  target_link_libraries(npa_asr PRIVATE winhttp shlwapi ws2_32)
+  # shell32: Shell_NotifyIcon (the notification-area icon in platform_win.cpp)
+  target_link_libraries(npa_asr PRIVATE winhttp shlwapi shell32 ws2_32)
   # Application manifest: Per-Monitor-V2 DPI awareness (a statically linked GLFW
   # cannot carry its own manifest), long path support, asInvoker.
   if(MSVC)

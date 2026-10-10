@@ -17,6 +17,10 @@ on:
         description: 'Quantizations to build (space separated)'
         default: 'f16 q8_0 q5_0 q4_0'
         required: true
+      recommend:
+        description: 'Quantization the app suggests in the catalogue (must be in quants)'
+        default: 'q4_0'
+        required: true
       release_tag:
         description: 'Release tag the assets are published to'
         default: 'models-v3-e2e_rnnt'
@@ -40,7 +44,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install gguf numpy sentencepiece
+          # gguf-py is pinned: its API for quantized tensors (add_tensor with
+          # raw_dtype and the byte-shaped tensor) is what the converter targets.
+          pip install gguf==0.19.0 numpy sentencepiece
 
       - name: Download the Hugging Face checkpoint (revision e2e_rnnt)
         run: |
@@ -59,15 +65,21 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          RECOMMEND="${{ github.event.inputs.recommend || 'q4_0' }}"
           rm -f models/manifest.json
           for q in ${{ github.event.inputs.quants || 'f16 q8_0 q5_0 q4_0' }}; do
+            REC=""
+            if [ "$q" = "$RECOMMEND" ]; then REC="--recommend"; fi
             python tools/convert_gigaam_to_gguf.py \
               --model-dir models/hf/gigaam-v3-e2e_rnnt \
               --out "models/gguf/gigaam-v3-e2e_rnnt-${q}.gguf" \
               --quant "${q}" \
               --manifest models/manifest.json \
-              --release-base "${BASE}"
+              --release-base "${BASE}" $REC
           done
+          # the mark has to end up on exactly one quantization
+          test "$(grep -c '"recommended": true' models/manifest.json)" = "1"
+          grep -B4 '"recommended": true' models/manifest.json
           echo '--- manifest ---'
           cat models/manifest.json
           ls -la models/gguf

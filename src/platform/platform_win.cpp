@@ -334,6 +334,236 @@ bool paste_into_focused_window() {
     return sent != 0;
 }
 
+// -------------------------------------------------------------------- tray
+
+namespace {
+
+constexpr UINT kTrayCallback = WM_APP + 1;  // mouse events for our icon
+constexpr UINT kTrayQuit     = WM_APP + 2;  // "stop the message loop"
+constexpr UINT kTrayIconId   = 1;
+constexpr UINT kMenuShow     = 1;
+constexpr UINT kMenuQuit     = 2;
+const wchar_t * const kTrayClass = L"npa_asr_tray";
+
+// A HICON built from app_icon_rgba().  The shell copies it, so the caller may
+// destroy it as soon as Shell_NotifyIcon() has seen it.
+HICON make_app_icon(int size) {
+    std::vector<unsigned char> rgba;
+    if (!app_icon_rgba(size, &rgba)) return nullptr;
+
+    BITMAPV5HEADER header = {};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = size;
+    header.bV5Height = -size;  // top-down, like the RGBA buffer
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00FF0000u;
+    header.bV5GreenMask = 0x0000FF00u;
+    header.bV5BlueMask = 0x000000FFu;
+    header.bV5AlphaMask = 0xFF000000u;
+
+    void * bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP color = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO *>(&header),
+                                     DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (color == nullptr || bits == nullptr) {
+        if (color != nullptr) DeleteObject(color);
+        return nullptr;
+    }
+    // DIB pixels are BGRA in memory; app_icon_rgba() produces RGBA.
+    unsigned char * dst = static_cast<unsigned char *>(bits);
+    for (size_t i = 0; i < rgba.size(); i += 4) {
+        dst[i + 0] = rgba[i + 2];
+        dst[i + 1] = rgba[i + 1];
+        dst[i + 2] = rgba[i + 0];
+        dst[i + 3] = rgba[i + 3];
+    }
+    // A 32-bit icon still has an AND mask; all-zero means "use the alpha".
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    ICONINFO info = {};
+    info.fIcon = TRUE;
+    info.hbmColor = color;
+    info.hbmMask = mask != nullptr ? mask : color;
+    HICON icon = CreateIconIndirect(&info);
+    DeleteObject(color);
+    if (mask != nullptr) DeleteObject(mask);
+    return icon;
+}
+
+}  // namespace
+
+// The Windows notification-area icon.  Shell_NotifyIcon() delivers callbacks to
+// a window, so the icon owns a hidden top-level window (not HWND_MESSAGE:
+// message-only windows do not receive the TaskbarCreated broadcast that tells us
+// to re-add the icon after Explorer restarts) with a message loop on its own
+// thread.  The user's choice is published through an atomic and picked up by the
+// UI thread, so this thread never touches the GLFW window.
+class WinTrayIcon final : public TrayIcon {
+public:
+    ~WinTrayIcon() override { remove(); }
+
+    bool add(const std::string & tooltip, std::string * err) override {
+        if (thread_.joinable()) return true;
+        auto ready = std::make_shared<std::promise<bool>>();
+        std::future<bool> done = ready->get_future();
+        thread_ = std::thread([this, tooltip, ready]() { run(tooltip, ready); });
+        if (done.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            if (err != nullptr) *err = "истекло время ожидания оболочки";
+            return false;
+        }
+        const bool ok = done.get();
+        if (!ok && err != nullptr && err->empty()) *err = "оболочка отказала в значке";
+        return ok;
+    }
+
+    void remove() override {
+        HWND hwnd = hwnd_.load();
+        if (hwnd != nullptr) PostMessageW(hwnd, kTrayQuit, 0, 0);
+        if (thread_.joinable()) thread_.join();
+        hwnd_ = nullptr;
+        action_ = 0;
+    }
+
+    TrayAction take_action() override {
+        switch (action_.exchange(0)) {
+            case 1: return TrayAction::Show;
+            case 2: return TrayAction::Quit;
+            default: return TrayAction::None;
+        }
+    }
+
+    const char * backend_name() const override { return "windows shell"; }
+
+private:
+    void run(const std::string & tooltip, const std::shared_ptr<std::promise<bool>> & ready) {
+        tooltip_ = tooltip;
+        HINSTANCE instance = GetModuleHandleW(nullptr);
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = &WinTrayIcon::wnd_proc;
+        wc.hInstance = instance;
+        wc.lpszClassName = kTrayClass;
+        if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            ready->set_value(false);
+            return;
+        }
+        HWND hwnd = CreateWindowExW(0, kTrayClass, L"npa_asr", WS_POPUP, 0, 0, 0, 0,
+                                    nullptr, nullptr, instance, nullptr);
+        if (hwnd == nullptr) {
+            ready->set_value(false);
+            return;
+        }
+        hwnd_ = hwnd;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
+
+        const int icon_size = GetSystemMetrics(SM_CXSMICON);
+        icon_ = make_app_icon(icon_size > 8 ? icon_size : 16);
+        if (!add_icon()) {
+            // Nothing to wait for: without the icon the window has no purpose.
+            ready->set_value(false);
+            if (icon_ != nullptr) DestroyIcon(icon_);
+            icon_ = nullptr;
+            DestroyWindow(hwnd);
+            hwnd_ = nullptr;
+            return;
+        }
+        ready->set_value(true);
+
+        MSG msg = {};
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        if (added_.load()) Shell_NotifyIconW(NIM_DELETE, &nid_);
+        if (icon_ != nullptr) DestroyIcon(icon_);
+        icon_ = nullptr;
+        DestroyWindow(hwnd);
+        hwnd_ = nullptr;
+    }
+
+    bool add_icon() {
+        nid_ = {};
+        nid_.cbSize = sizeof(nid_);
+        nid_.hWnd = hwnd_.load();
+        nid_.uID = kTrayIconId;
+        nid_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid_.uCallbackMessage = kTrayCallback;
+        nid_.hIcon = icon_;
+        const std::wstring tip = utf8_to_utf16(tooltip_);
+        const size_t room = sizeof(nid_.szTip) / sizeof(wchar_t) - 1;
+        const size_t n = tip.size() < room ? tip.size() : room;
+        if (n > 0) std::memcpy(nid_.szTip, tip.data(), n * sizeof(wchar_t));
+        nid_.szTip[n] = L'\0';
+        added_ = Shell_NotifyIconW(NIM_ADD, &nid_) != FALSE;
+        return added_.load();
+    }
+
+    void show_menu(HWND hwnd) {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return;
+        AppendMenuW(menu, MF_STRING, kMenuShow, L"Открыть окно");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kMenuQuit, L"Выход");
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+        // Documented TrackPopupMenu requirement: without this the menu stays up
+        // when the user clicks somewhere else.
+        SetForegroundWindow(hwnd);
+        const UINT cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                                        cursor.x, cursor.y, 0, hwnd, nullptr);
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        if (cmd == kMenuShow) action_ = 1;
+        if (cmd == kMenuQuit) action_ = 2;
+    }
+
+    static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto * self = reinterpret_cast<WinTrayIcon *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (self == nullptr) return DefWindowProcW(hwnd, msg, wp, lp);
+        const UINT taskbar_created = self->taskbar_created_.load();
+        if (taskbar_created != 0 && msg == taskbar_created) {
+            self->added_ = false;  // a fresh shell knows nothing about us
+            self->add_icon();
+            return 0;
+        }
+        switch (msg) {
+            case kTrayCallback:
+                if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) self->action_ = 1;
+                else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) self->show_menu(hwnd);
+                return 0;
+            case kTrayQuit:
+                PostQuitMessage(0);
+                return 0;
+            case WM_COMMAND:
+                // The popup menu is read with TPM_RETURNCMD and does not post
+                // this, but a posted command (script, test) means the same.
+                if (LOWORD(wp) == kMenuShow) self->action_ = 1;
+                if (LOWORD(wp) == kMenuQuit) self->action_ = 2;
+                return 0;
+            case WM_CLOSE:
+                PostQuitMessage(0);
+                return 0;
+            default:
+                return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    }
+
+    std::thread thread_;
+    std::atomic<HWND> hwnd_{nullptr};
+    std::atomic<int> action_{0};
+    std::atomic<bool> added_{false};
+    std::atomic<UINT> taskbar_created_{0};
+    HICON icon_ = nullptr;
+    NOTIFYICONDATAW nid_ = {};
+    std::string tooltip_;
+};
+
+std::unique_ptr<TrayIcon> create_tray_icon() { return std::make_unique<WinTrayIcon>(); }
+
 // -------------------------------------------------------------------- misc
 
 std::string user_data_dir() {

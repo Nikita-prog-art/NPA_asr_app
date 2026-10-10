@@ -374,6 +374,13 @@ struct GuiState {
     char hotkey_buf[64] = {};
     std::string hotkey_status;
 
+    // notification area: with an icon the close button hides the window and the
+    // application keeps listening for the hotkey
+    std::unique_ptr<platform::TrayIcon> tray;
+    bool tray_active = false;
+    bool quit_requested = false;
+    std::string tray_status;
+
     // transcript
     std::string transcript;
     std::string last_final;
@@ -569,6 +576,45 @@ void set_always_on_top(GLFWwindow * window, bool on) {
     const int wanted = on ? GLFW_TRUE : GLFW_FALSE;
     if (glfwGetWindowAttrib(window, kAlwaysOnTopAttrib) == wanted) return;
     glfwSetWindowAttrib(window, kAlwaysOnTopAttrib, wanted);
+}
+
+// ------------------------------------------------------------------ tray
+
+// Brings the window back from the notification area.  Works for both states the
+// user can leave it in: hidden ("крестик") and minimised (taskbar button).
+void show_main_window(GLFWwindow * window) {
+    if (window == nullptr) return;
+    if (glfwGetWindowAttrib(window, GLFW_ICONIFIED)) glfwRestoreWindow(window);
+    glfwShowWindow(window);
+    glfwFocusWindow(window);
+}
+
+// The close button: hide instead of quit while the tray icon is there.  The
+// controller keeps running, so the push-to-talk hotkey still works and the tray
+// icon is the way back.
+void glfw_close_callback(GLFWwindow * window) {
+    auto * ui = static_cast<GuiState *>(glfwGetWindowUserPointer(window));
+    if (ui == nullptr || !ui->tray_active) return;  // no tray: really close
+    glfwSetWindowShouldClose(window, GLFW_FALSE);
+    glfwHideWindow(window);
+    ui->tray_status = "приложение свёрнуто в трей — значок рядом с часами";
+}
+
+// Picks up what the user chose in the notification area.  Called once per frame
+// from the UI thread; the tray backend only records the choice.
+void poll_tray(GuiState & ui, GLFWwindow * window) {
+    if (!ui.tray) return;
+    switch (ui.tray->take_action()) {
+        case platform::TrayAction::Show:
+            show_main_window(window);
+            ui.tray_status.clear();
+            break;
+        case platform::TrayAction::Quit:
+            ui.quit_requested = true;
+            break;
+        default:
+            break;
+    }
 }
 
 // ------------------------------------------------------------------ model load
@@ -898,18 +944,22 @@ void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * wind
 
     bool auto_threads = ui.settings.n_threads == 0;
     if (ImGui::Checkbox("авто", &auto_threads)) {
-        ui.settings.n_threads = auto_threads ? 0 : hw;
+        ui.settings.n_threads = auto_threads ? 0 : default_n_threads();
         touch_settings(ui);
     }
     ImGui::SameLine();
-    int threads = ui.settings.n_threads > 0 ? ui.settings.n_threads : hw;
+    int threads = ui.settings.n_threads > 0 ? ui.settings.n_threads : default_n_threads();
     ImGui::BeginDisabled(auto_threads);
     if (ImGui::SliderInt("Потоки", &threads, 1, hw)) {
         ui.settings.n_threads = threads;
         touch_settings(ui);
     }
     ImGui::EndDisabled();
-    ImGui::TextDisabled("используется: %d из %d", st.n_threads, hw);
+    if (auto_threads) {
+        ImGui::TextDisabled("используется: %d из %d (авто: половина логических ядер)", st.n_threads, hw);
+    } else {
+        ImGui::TextDisabled("используется: %d из %d", st.n_threads, hw);
+    }
 
     if (ImGui::SliderFloat("Шаг потока, с", &ui.settings.step_sec, 0.2f, 3.0f, "%.2f")) touch_settings(ui);
     if (ImGui::SliderFloat("Окно, с", &ui.settings.max_window_sec, 5.0f, 30.0f, "%.1f")) touch_settings(ui);
@@ -1042,6 +1092,25 @@ void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * wind
                      "администратора не нужны); настройки и модели остаются на месте.");
     text_dim_wrapped("Командная строка: npa_asr --install | --autostart on|off | "
                      "--install-status | --uninstall");
+
+    ImGui::SeparatorText("Завершение работы");
+    if (ui.tray_active) {
+        text_dim_wrapped("Крестик сворачивает приложение в трей: распознавание и сочетание "
+                         "клавиш продолжают работать, вернуться можно щелчком по значку рядом "
+                         "с часами (там же «Выход»).");
+        if (ImGui::Button("Свернуть в трей")) {
+            glfwHideWindow(window);
+            ui.tray_status = "приложение свёрнуто в трей — значок рядом с часами";
+        }
+        ImGui::SameLine();
+    } else {
+        text_dim_wrapped("Системный трей недоступен, поэтому крестик закрывает приложение.");
+    }
+    if (ImGui::Button("Выход")) ui.quit_requested = true;
+    if (!ui.tray_status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", ui.tray_status.c_str());
+    }
 }
 
 void draw_models_tab(GuiState & ui, Controller & controller) {
@@ -1136,10 +1205,24 @@ void draw_models_tab(GuiState & ui, Controller & controller) {
         const net::ModelEntry & entry = ui.manifest.models[mi];
         ImGui::SeparatorText(entry.name.empty() ? entry.id.c_str() : entry.name.c_str());
         if (!entry.license.empty()) ImGui::TextDisabled("Лицензия: %s", entry.license.c_str());
-        for (size_t fi = 0; fi < entry.files.size(); ++fi) {
+        // The suggested quantization goes first; the rest stays by size, so the
+        // list reads "what to take" before "the other options".
+        std::vector<size_t> order(entry.files.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            const net::ModelFile & fa = entry.files[a];
+            const net::ModelFile & fb = entry.files[b];
+            if (fa.recommended != fb.recommended) return fa.recommended;
+            return fa.size > fb.size;
+        });
+        for (size_t fi : order) {
             const net::ModelFile & file = entry.files[fi];
             ImGui::PushID(static_cast<int>(mi * 1000 + fi));
             ImGui::Text("%-10s %s", file.quant.c_str(), format_mb(file.size).c_str());
+            if (file.recommended) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("рекомендуется");
+            }
             ImGui::SameLine();
             ImGui::BeginDisabled(ui.job != nullptr);
             if (ImGui::Button("Скачать")) {
@@ -1615,6 +1698,18 @@ int run_gui(bool minimized) {
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);  // vsync: the main loop runs at the display rate (~60 FPS)
+    {
+        // The same icon the tray uses, so the taskbar/Alt-Tab entry is not the
+        // generic GLFW one.
+        std::vector<unsigned char> icon_px;
+        if (platform::app_icon_rgba(32, &icon_px)) {
+            GLFWimage image;
+            image.width = 32;
+            image.height = 32;
+            image.pixels = icon_px.data();
+            glfwSetWindowIcon(window, 1, &image);
+        }
+    }
     // Size limits are in screen coordinates, i.e. physical pixels on a scaled
     // display, so they have to be scaled as well.
     const float start_scale = monitor_scale(nullptr);
@@ -1648,6 +1743,8 @@ int run_gui(bool minimized) {
     // into them instead of overwriting them
     glfwSetKeyCallback(window, glfw_key_callback);
     glfwSetDropCallback(window, glfw_drop_callback);
+    // The ImGui GLFW backend installs no close callback of its own.
+    glfwSetWindowCloseCallback(window, glfw_close_callback);
 
     if (!ImGui_ImplGlfw_InitForOpenGL(window, true)) {
         std::fprintf(stderr, "npa_asr: ImGui_ImplGlfw_InitForOpenGL() failed\n");
@@ -1688,11 +1785,39 @@ int run_gui(bool minimized) {
     // update) the per-user copy once - see should_offer_install().
     ui.install_offer = should_offer_install();
 
+    // ---- notification area: the close button hides the window while the icon
+    // is there (the hotkey keeps working), and "Выход" in its menu quits.
+    ui.tray = platform::create_tray_icon();
+    {
+        std::string tray_error;
+        const std::string tip = "NPA ASR " + std::string(ASR_VERSION) + " — удерживайте " +
+                                ui.settings.hotkey + ", чтобы записать";
+        if (ui.tray->add(tip, &tray_error)) {
+            ui.tray_active = true;
+            ui.log_lines.push_back("трей: значок добавлен (" +
+                                   std::string(ui.tray->backend_name()) + ")");
+        } else {
+            ui.log_lines.push_back("трей: недоступен, крестик закрывает приложение (" +
+                                   tray_error + ")");
+        }
+    }
+
     if (minimized) glfwIconifyWindow(window);  // the autostart entry starts this way
 
-    while (!glfwWindowShouldClose(window)) {
-        glfwPollEvents();
+    while (!glfwWindowShouldClose(window) && !ui.quit_requested) {
+        const bool visible = glfwGetWindowAttrib(window, GLFW_VISIBLE) != GLFW_FALSE;
+        if (visible) {
+            glfwPollEvents();
+        } else {
+            // In the tray: nothing is drawn, so wait for the next event instead
+            // of spinning.  The tray backend uses its own thread, hence the
+            // short timeout rather than an indefinite wait.
+            glfwWaitEventsTimeout(0.05);
+        }
+        poll_tray(ui, window);
         poll_background(ui, controller);
+        if (!visible) continue;  // hidden: no frames, no ImGui state to update
+
         // before NewFrame: the theme/scale and the window size they need
         update_interface_scale(ui, window);
 
@@ -1718,6 +1843,7 @@ int run_gui(bool minimized) {
     }
 
     // ---- shutdown: persist settings, stop the controller, tear GLFW down
+    if (ui.tray) ui.tray->remove();
     {
         std::string save_error;
         if (!ui.settings.save(&save_error)) {

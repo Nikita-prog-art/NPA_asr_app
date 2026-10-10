@@ -25,12 +25,16 @@ size_t lcp(const std::vector<int> & a, const std::vector<int> & b) {
 Recognizer::Recognizer() = default;
 Recognizer::~Recognizer() = default;
 
+int default_n_threads() {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 2;  // unknown: behave like a dual-core machine
+    const unsigned n = hw / 2;
+    return static_cast<int>(n > 0 ? n : 1);
+}
+
 bool Recognizer::init(const RecognizerConfig & cfg, std::string * err) {
     cfg_ = cfg;
-    if (cfg_.n_threads <= 0) {
-        cfg_.n_threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (cfg_.n_threads <= 0) cfg_.n_threads = 4;
-    }
+    if (cfg_.n_threads <= 0) cfg_.n_threads = default_n_threads();
     if (!model_.load(cfg_.model_path, err)) return false;
     model_.set_n_threads(cfg_.n_threads);
 
