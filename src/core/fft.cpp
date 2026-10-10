@@ -11,26 +11,7 @@
 
 namespace asr {
 
-namespace {
-// The application ships a single self-contained implementation.  The name is
-// still parsed (and "mkl" is still accepted) so that old command lines and
-// settings keep working, but everything now runs on the built-in Bluestein FFT.
-enum FftBackend { kFftAuto = 0, kFftInternal = 1, kFftMklRemoved = 2 };
-int g_fft_backend = kFftAuto;
-}  // namespace
-
-void set_fft_backend(const std::string & name) {
-    if (name == "internal" || name == "builtin" || name == "bluestein") {
-        g_fft_backend = kFftInternal;
-    } else if (name == "mkl" || name == "onemkl") {
-        g_fft_backend = kFftMklRemoved;
-    } else {
-        g_fft_backend = kFftAuto;
-    }
-}
-
 std::string fft_backend_name() {
-    if (g_fft_backend == kFftMklRemoved) return "internal Bluestein (oneMKL support was removed)";
     return "internal Bluestein";
 }
 
@@ -92,8 +73,6 @@ Rfft::Rfft(int n) : n_(n) {
 }
 
 Rfft::~Rfft() = default;
-
-bool Rfft::using_mkl() const { return false; }
 
 void Rfft::forward_internal(const float * in, std::complex<float> * out,
                             std::complex<double> * scratch) const {

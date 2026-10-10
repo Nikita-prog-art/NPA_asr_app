@@ -5,11 +5,24 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 #include "app/cli.h"
 #include "app/gui.h"
 #include "core/backend_info.h"
 
 int main(int argc, char ** argv) {
+#if defined(_WIN32)
+    // The CLI prints Russian text as UTF-8.  Without this the console renders it
+    // through its legacy OEM code page (cp866/cp1251) and it comes out garbled.
+    ::SetConsoleOutputCP(CP_UTF8);
+#endif
+
     // A statically linked binary carries exactly one CPU backend, so a machine
     // without the required instructions would die with SIGILL deep inside ggml.
     // Say so up front, together with the way to get a binary that runs here.

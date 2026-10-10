@@ -12,9 +12,7 @@
 
 namespace asr {
 
-// Kept for compatibility with existing command lines and settings: every name
-// now selects the built-in implementation.  Set before creating any Rfft.
-void set_fft_backend(const std::string & name);
+// Kept as a diagnostic string for `--info` and the benchmark tool.
 std::string fft_backend_name();
 
 class Rfft {
@@ -27,7 +25,6 @@ public:
 
     int size() const { return n_; }
     int n_bins() const { return n_ / 2 + 1; }  // onesided rfft size
-    bool using_mkl() const;                    // always false, kept for tests
 
     // out must hold n_bins() complex values.
     void forward(const float * in, std::complex<float> * out) const;

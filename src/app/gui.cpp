@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -32,11 +33,22 @@
 #include <GLFW/glfw3.h>
 
 #include "app/controller.h"
+#include "app/install.h"
 #include "app/models.h"
 #include "app/settings.h"
 #include "core/backend_info.h"
 #include "net/manifest.h"
 #include "platform/platform.h"
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
 
 namespace asr::app {
 
@@ -59,9 +71,51 @@ const ImVec4 kDimText(0.62f, 0.65f, 0.70f, 1.00f);
 
 // ------------------------------------------------------------------ helpers
 
+// The application manifest asks Windows for Per-Monitor-V2 DPI awareness, but
+// the request is repeated here: it is a no-op when the manifest already did it,
+// and it keeps the window crisp on toolchains that do not compile the resource
+// file.  Without it Windows bitmap-stretches the whole window at 125% and the
+// content scale GLFW reports stays 1.0.
+void ensure_dpi_awareness() {
+#if defined(_WIN32)
+    using set_ctx_fn = BOOL(WINAPI *)(HANDLE);
+    using set_aware_fn = BOOL(WINAPI *)(void);
+    HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
+    if (user32 == nullptr) return;
+    auto set_ctx = reinterpret_cast<set_ctx_fn>(
+        reinterpret_cast<void *>(::GetProcAddress(user32, "SetProcessDpiAwarenessContext")));
+    if (set_ctx != nullptr) {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE) -4
+        set_ctx(reinterpret_cast<HANDLE>(static_cast<intptr_t>(-4)));
+        return;
+    }
+    auto set_aware = reinterpret_cast<set_aware_fn>(
+        reinterpret_cast<void *>(::GetProcAddress(user32, "SetProcessDPIAware")));
+    if (set_aware != nullptr) set_aware();
+#endif
+}
+
 double now_seconds() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+float clamp_scale(float scale) {
+    return std::max(0.75f, std::min(3.0f, scale));
+}
+
+// The scale the window's monitor asks for (1.25 at "125%" on Windows, usually
+// 1.0 on X11 unless Xft.dpi says otherwise).
+float monitor_scale(GLFWwindow * window) {
+    float sx = 1.0f;
+    float sy = 1.0f;
+    if (window != nullptr) {
+        glfwGetWindowContentScale(window, &sx, &sy);
+    } else if (GLFWmonitor * primary = glfwGetPrimaryMonitor()) {
+        glfwGetMonitorContentScale(primary, &sx, &sy);
+    }
+    if (!(sx > 0.0f)) sx = 1.0f;  // some accessibility tools report 0.0
+    return clamp_scale(sx);
 }
 
 std::string lower_copy(std::string s) {
@@ -129,14 +183,30 @@ std::string first_existing_font(const char * const * paths, size_t count) {
     return std::string();
 }
 
+// Latin + Cyrillic (the labels and the recognised text are Russian) plus the
+// punctuation and symbols the interface uses: ImGui renders a missing glyph as
+// '?', so the ranges have to cover what the code actually prints.
+const ImWchar * ui_glyph_ranges() {
+    static const ImWchar ranges[] = {
+        0x0020, 0x00FF,  // Basic Latin + Latin Supplement
+        0x0400, 0x052F,  // Cyrillic + Cyrillic Supplement
+        0x2010, 0x205E,  // General Punctuation (dashes, quotes, ellipsis)
+        0x2116, 0x2117,  // №
+        0x2190, 0x21FF,  // Arrows
+        0x25A0, 0x25FF,  // Geometric Shapes (● ○ ■)
+        0x20AC, 0x20AC,  // €
+        0,
+    };
+    return ranges;
+}
+
 // Adds the first available font of a candidate list.  Returns nullptr when none
 // of the files can be loaded (the caller then keeps the previous font).
 ImFont * add_cyrillic_font(ImFontAtlas * atlas, const char * const * paths, size_t count,
                            float size_px) {
     const std::string path = first_existing_font(paths, count);
     if (path.empty()) return nullptr;
-    return atlas->AddFontFromFileTTF(path.c_str(), size_px, nullptr,
-                                     atlas->GetGlyphRangesCyrillic());
+    return atlas->AddFontFromFileTTF(path.c_str(), size_px, nullptr, ui_glyph_ranges());
 }
 
 // ------------------------------------------------------------------ theme
@@ -207,6 +277,19 @@ void apply_theme(bool dark) {
     }
 }
 
+// Applies the theme and then the interface scale.  ScaleAllSizes() multiplies
+// the style in place, so the style has to be rebuilt from scratch every time the
+// scale changes (a monitor with a different DPI, or Ctrl +/-).
+void apply_style(bool dark, float scale) {
+    apply_theme(dark);
+    if (!(scale > 0.0f)) return;
+    ImGuiStyle & s = ImGui::GetStyle();
+    s.ScaleAllSizes(scale);
+    // ImGui 1.92 rasterises fonts on demand at FontSizeBase * FontScaleDpi, so
+    // the glyphs stay crisp instead of being scaled up as a texture.
+    s.FontScaleDpi = scale;
+}
+
 // ------------------------------------------------------------------ state
 
 // Result of a background fetch_manifest() call.  Kept alive by shared_ptr so the
@@ -232,6 +315,23 @@ struct GuiState {
     bool always_on_top = true;
     bool theme_applied = false;
     bool ptt_mouse_held = false;
+
+    // interface scale: the value actually applied, the monitor's suggestion and
+    // a pending change requested by Ctrl +/- or the settings tab
+    float ui_scale = 1.0f;
+    float monitor_scale_now = 1.0f;
+    bool scale_pending = false;
+    std::string scale_toast;
+    double scale_toast_until = 0.0;
+
+    // per-user install / autostart
+    InstallStatus install;
+    bool install_checked = false;
+    bool install_offer = false;      // first-run prompt
+    bool install_autostart = true;   // checkbox in the prompt
+    bool install_popup_opened = false;
+    std::string install_message;
+    std::string install_error;
 
     // hotkey capture
     bool capturing = false;
@@ -343,12 +443,49 @@ bool glfw_key_to_chord(int key, int mods, std::string * out) {
     return true;
 }
 
+// Ctrl + / Ctrl - / Ctrl 0 change the interface scale.  This is deliberately
+// handled before the hotkey capture so the shortcuts keep working while a text
+// field has focus and while a new chord is being recorded.
+void handle_scale_shortcut(GuiState & ui, int key) {
+    bool reset = false;
+    float step = 0.0f;
+    if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD) {
+        step = 0.05f;
+    } else if (key == GLFW_KEY_MINUS || key == GLFW_KEY_KP_SUBTRACT) {
+        step = -0.05f;
+    } else if (key == GLFW_KEY_0 || key == GLFW_KEY_KP_0) {
+        reset = true;
+    } else {
+        return;
+    }
+
+    if (reset) {
+        ui.settings.ui_scale = 0.0f;  // back to the monitor's own scale
+    } else {
+        const float base = ui.settings.ui_scale > 0.0f ? ui.settings.ui_scale : ui.ui_scale;
+        const float next = clamp_scale(base + step);
+        ui.settings.ui_scale = std::round(next * 20.0f) / 20.0f;  // 5% steps
+    }
+    ui.scale_pending = true;
+    touch_settings(ui);
+}
+
 // Installed before ImGui_ImplGlfw_InitForOpenGL() so that the backend chains
 // into it (it stores and calls the previous GLFW key callback).
 void glfw_key_callback(GLFWwindow * window, int key, int scancode, int action, int mods) {
     (void) scancode;
     GuiState * ui = static_cast<GuiState *>(glfwGetWindowUserPointer(window));
-    if (ui == nullptr || !ui->capturing) return;
+    if (ui == nullptr) return;
+
+    if (action == GLFW_PRESS && (mods & GLFW_MOD_CONTROL) != 0) {
+        if (key == GLFW_KEY_EQUAL || key == GLFW_KEY_KP_ADD || key == GLFW_KEY_MINUS ||
+            key == GLFW_KEY_KP_SUBTRACT || key == GLFW_KEY_0 || key == GLFW_KEY_KP_0) {
+            handle_scale_shortcut(*ui, key);
+            return;
+        }
+    }
+
+    if (!ui->capturing) return;
     if (action != GLFW_PRESS) return;
 
     if (key == GLFW_KEY_ESCAPE) {
@@ -809,7 +946,7 @@ void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * wind
     ImGui::SeparatorText("Окно и оформление");
 
     if (ImGui::Checkbox("Тёмная тема", &ui.settings.dark_theme)) {
-        apply_theme(ui.settings.dark_theme);
+        ui.scale_pending = true;  // apply_style() rebuilds theme + scale
         touch_settings(ui);
     }
     if (ImGui::Checkbox("Поверх остальных окон", &ui.always_on_top)) {
@@ -817,6 +954,27 @@ void draw_settings_tab(GuiState & ui, Controller & controller, GLFWwindow * wind
         set_always_on_top(window, ui.always_on_top);
         touch_settings(ui);
     }
+
+    // ---- interface scale: Ctrl +/-, or the buttons, or automatic (monitor DPI)
+    ImGui::TextUnformatted("Масштаб интерфейса");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("-##scale_down")) handle_scale_shortcut(ui, GLFW_KEY_MINUS);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+##scale_up")) handle_scale_shortcut(ui, GLFW_KEY_EQUAL);
+    ImGui::SameLine();
+    ImGui::Text("%d %%", static_cast<int>(std::lround(ui.ui_scale * 100.0f)));
+    ImGui::SameLine();
+    bool auto_scale = ui.settings.ui_scale <= 0.0f;
+    if (ImGui::Checkbox("авто##scale_auto", &auto_scale)) {
+        ui.settings.ui_scale = auto_scale ? 0.0f : ui.ui_scale;
+        ui.scale_pending = true;
+        touch_settings(ui);
+    }
+    if (auto_scale) {
+        ImGui::TextDisabled("по масштабу монитора: %d %%",
+                            static_cast<int>(std::lround(ui.monitor_scale_now * 100.0f)));
+    }
+    ImGui::TextDisabled("горячие клавиши: Ctrl + / Ctrl - / Ctrl 0 (шаг 5 %%)");
 
     ImGui::Separator();
     if (ImGui::Button("Сохранить настройки")) {
@@ -986,6 +1144,151 @@ void draw_log_tab(GuiState & ui) {
     ImGui::EndChild();
 }
 
+// ------------------------------------------------------------------ install
+
+void refresh_install_status(GuiState & ui) {
+    ui.install = install_status();
+    ui.install_checked = true;
+}
+
+void run_install(GuiState & ui, bool autostart, bool autostart_only) {
+    std::string err;
+    if (install_app(autostart, autostart_only, &err)) {
+        refresh_install_status(ui);
+        ui.install_error.clear();
+        ui.install_message = autostart_only ? "автозагрузка включена"
+                                            : "установлено: " + ui.install.install_exe;
+    } else {
+        ui.install_error = err;
+    }
+    mark_install_prompt_shown();
+}
+
+void run_uninstall(GuiState & ui) {
+    std::string err;
+    if (uninstall_app(false, &err)) {
+        refresh_install_status(ui);
+        ui.install_error.clear();
+        ui.install_message = "установленная копия и автозагрузка удалены";
+    } else {
+        ui.install_error = err;
+    }
+}
+
+void set_autostart_checked(GuiState & ui, bool on) {
+    std::string err;
+    if (set_autostart(on, &err)) {
+        refresh_install_status(ui);
+        ui.install_error.clear();
+        ui.install_message = on ? "автозагрузка включена" : "автозагрузка выключена";
+    } else {
+        ui.install_error = err;
+    }
+}
+
+// Dimmed text that wraps: install paths are long and the panel is narrow.
+void text_dim_wrapped(const std::string & text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+    ImGui::TextWrapped("%s", text.c_str());
+    ImGui::PopStyleColor();
+}
+
+void draw_install_section(GuiState & ui) {
+    if (!ui.install_checked) refresh_install_status(ui);
+    const InstallStatus & st = ui.install;
+
+    if (st.running_installed) {
+        ImGui::TextWrapped("Приложение запущено из установленной копии.");
+    } else if (st.installed && st.up_to_date) {
+        ImGui::TextWrapped("Установленная копия совпадает с запущенной.");
+    } else if (st.installed) {
+        ImGui::TextWrapped("Установленная копия есть, но отличается от запущенной.");
+    } else {
+        ImGui::TextWrapped("Приложение не установлено, запускается из текущего файла.");
+    }
+    text_dim_wrapped("Каталог установки: " + st.install_dir);
+    if (!st.detail.empty()) text_dim_wrapped(st.detail);
+
+    bool autostart = st.autostart;
+    if (ImGui::Checkbox("Запускать при входе в систему (свёрнутым)", &autostart)) {
+        set_autostart_checked(ui, autostart);
+    }
+    text_dim_wrapped("Автозапуск: " + st.autostart_target);
+
+    if (!st.running_installed) {
+        if (ImGui::Button(st.installed ? "Обновить установленную копию" : "Установить в систему")) {
+            run_install(ui, false, false);
+        }
+        ImGui::SameLine();
+    }
+    if (st.installed && !st.running_installed) {
+        if (ImGui::Button("Удалить установленную копию")) run_uninstall(ui);
+        ImGui::SameLine();
+    }
+    if (ImGui::Button("Проверить")) refresh_install_status(ui);
+
+    if (!ui.install_message.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, accent_color(ui.settings.dark_theme));
+        ImGui::TextWrapped("%s", ui.install_message.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (!ui.install_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kRecordingRed);
+        ImGui::TextWrapped("%s", ui.install_error.c_str());
+        ImGui::PopStyleColor();
+    }
+}
+
+// Shown once, on the first run of a copy that is not installed yet.
+void draw_install_popup(GuiState & ui) {
+    if (!ui.install_offer) return;
+
+    if (!ui.install_popup_opened) {
+        refresh_install_status(ui);
+        ui.install_autostart = ui.install.autostart || !ui.install.installed;
+        ImGui::OpenPopup("Установка приложения");
+        ui.install_popup_opened = true;
+    }
+
+    const ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f * ui.ui_scale, 0.0f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Установка приложения", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    ImGui::TextWrapped("Скопировать приложение в личную папку пользователя и запускать его при входе в систему?");
+    ImGui::Spacing();
+    ImGui::BulletText("Программа: %s", ui.install.install_exe.c_str());
+    ImGui::BulletText("Настройки и модели остаются в %s", platform::user_data_dir().c_str());
+    ImGui::BulletText("Установка не требует прав администратора");
+    ImGui::Spacing();
+
+    bool autostart = ui.install_autostart;
+    if (ImGui::Checkbox("Запускать при входе в систему (свёрнутым)", &autostart)) {
+        ui.install_autostart = autostart;
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Установить", ImVec2(160.0f * ui.ui_scale, 0.0f))) {
+        run_install(ui, ui.install_autostart, false);
+        ui.install_offer = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Позже", ImVec2(120.0f * ui.ui_scale, 0.0f))) {
+        mark_install_prompt_shown();
+        ui.install_offer = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!ui.install_error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kRecordingRed);
+        ImGui::TextWrapped("%s", ui.install_error.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndPopup();
+}
+
 void draw_about_tab(GuiState & ui) {
     if (!ui.info_cached) {
         ui.backend_info = backend_summary();
@@ -1009,6 +1312,9 @@ void draw_about_tab(GuiState & ui) {
     ImGui::SeparatorText("Файлы");
     ImGui::TextWrapped("Настройки: %s", Settings::settings_path().c_str());
     ImGui::TextWrapped("Каталог моделей: %s", ui.models_dir.c_str());
+
+    ImGui::SeparatorText("Установка");
+    draw_install_section(ui);
 
     ImGui::SeparatorText("Модель и лицензия");
     if (ImGui::Button("Открыть страницу GigaAM-v3")) {
@@ -1052,10 +1358,24 @@ void poll_background(GuiState & ui, Controller & controller) {
 }
 
 void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
-    // the theme is applied on the very first frame, using the saved preference
-    if (!ui.theme_applied) {
-        apply_theme(ui.settings.dark_theme);
-        set_always_on_top(window, ui.always_on_top);
+    // ---- interface scale: monitor DPI, the explicit override and Ctrl +/-
+    const float monitor = monitor_scale(window);
+    const bool monitor_changed = std::fabs(monitor - ui.monitor_scale_now) > 0.001f;
+    ui.monitor_scale_now = monitor;
+
+    if (!ui.theme_applied || ui.scale_pending || monitor_changed) {
+        const bool first = !ui.theme_applied;
+        const float wanted =
+            ui.settings.ui_scale > 0.0f ? clamp_scale(ui.settings.ui_scale) : monitor;
+        apply_style(ui.settings.dark_theme, wanted);
+        if (!first && std::fabs(wanted - ui.ui_scale) > 0.001f) {
+            ui.scale_toast = "масштаб интерфейса: " +
+                             std::to_string(static_cast<int>(std::lround(wanted * 100.0f))) + " %";
+            ui.scale_toast_until = now_seconds() + 1.5;
+        }
+        ui.ui_scale = wanted;
+        ui.scale_pending = false;
+        if (first) set_always_on_top(window, ui.always_on_top);
         ui.theme_applied = true;
     }
 
@@ -1118,13 +1438,37 @@ void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
     ImGui::EndChild();
 
     ImGui::End();
+
+    // ---- transient scale indicator (Ctrl +/-, or a monitor change)
+    if (!ui.scale_toast.empty()) {
+        if (now_seconds() < ui.scale_toast_until) {
+            const ImGuiViewport * vp = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 12.0f * ui.ui_scale,
+                                           vp->WorkPos.y + vp->WorkSize.y - 12.0f * ui.ui_scale),
+                                    ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+            const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration |
+                                           ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize |
+                                           ImGuiWindowFlags_NoSavedSettings |
+                                           ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+            ImGui::SetNextWindowBgAlpha(0.85f);
+            if (ImGui::Begin("##scale_toast", nullptr, flags)) {
+                ImGui::TextUnformatted(ui.scale_toast.c_str());
+            }
+            ImGui::End();
+        } else {
+            ui.scale_toast.clear();
+        }
+    }
+
+    draw_install_popup(ui);
 }
 
 }  // namespace
 
 // ------------------------------------------------------------------ entry point
 
-int run_gui() {
+int run_gui(bool minimized) {
+    ensure_dpi_awareness();
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) {
         std::fprintf(stderr, "npa_asr: glfwInit() failed\n");
@@ -1155,7 +1499,12 @@ int run_gui() {
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);  // vsync: the main loop runs at the display rate (~60 FPS)
-    glfwSetWindowSizeLimits(window, 720, 480, GLFW_DONT_CARE, GLFW_DONT_CARE);
+    // Size limits are in screen coordinates, i.e. physical pixels on a scaled
+    // display, so they have to be scaled as well.
+    const float start_scale = monitor_scale(nullptr);
+    glfwSetWindowSizeLimits(window, static_cast<int>(std::lround(720.0f * start_scale)),
+                            static_cast<int>(std::lround(480.0f * start_scale)),
+                            GLFW_DONT_CARE, GLFW_DONT_CARE);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1218,6 +1567,12 @@ int run_gui() {
     ui.always_on_top = settings.always_on_top;
     std::snprintf(ui.path_buf, sizeof(ui.path_buf), "%s", ui.settings.model_path.c_str());
     std::snprintf(ui.hotkey_buf, sizeof(ui.hotkey_buf), "%s", ui.settings.hotkey.c_str());
+
+    // Offer to install the application once, on the first run of a copy that was
+    // not started from the install directory.
+    ui.install_offer = should_offer_install();
+
+    if (minimized) glfwIconifyWindow(window);  // the autostart entry starts this way
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();

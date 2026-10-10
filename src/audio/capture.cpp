@@ -65,12 +65,13 @@ bool Capture::start(int device_index, int sample_rate, std::function<void(const 
     ma_device_info * playback = nullptr;
     ma_device_info * capture_devs = nullptr;
     ma_uint32 n_playback = 0, n_capture = 0;
-    ma_device_id * want_id = nullptr;
     ma_context * ctx_ptr = nullptr;
     if (device_index >= 0 && ma_context_init(nullptr, 0, nullptr, &ctx) == MA_SUCCESS) {
         if (ma_context_get_devices(&ctx, &playback, &n_playback, &capture_devs, &n_capture) == MA_SUCCESS &&
             device_index < static_cast<int>(n_capture)) {
-            want_id = &capture_devs[device_index].id;
+            // The id only has to stay valid until ma_device_init() returns, and
+            // the context owns it until ma_context_uninit() below.
+            cfg.capture.pDeviceID = &capture_devs[device_index].id;
             impl_->name = capture_devs[device_index].name;
             ctx_ptr = &ctx;
         }

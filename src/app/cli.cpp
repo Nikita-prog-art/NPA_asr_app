@@ -40,12 +40,7 @@ void usage() {
         "  npa_asr -m MODEL.gguf --record 5   record 5 s from the microphone and transcribe\n"
         "  npa_asr --manifest               show the model catalogue\n"
         "  npa_asr --info                   backend / CPU information\n"
-        "  npa_asr --install                установить в профиль и включить автозапуск\n"
-        "  npa_asr --install-only           установить в профиль без автозапуска\n"
-        "  npa_asr --uninstall              удалить автозапуск и установленные файлы\n"
-        "  npa_asr --uninstall-keep-files   удалить автозапуск, установленные файлы оставить\n"
-        "  npa_asr --autostart on|off       включить или выключить автозапуск\n"
-        "  npa_asr --install-status         показать состояние установки и автозапуска\n"
+        "  npa_asr --install-status         show the install / autostart state\n"
         "\n"
         "options:\n"
         "  -m, --model PATH     path to the .gguf model\n"
@@ -56,9 +51,8 @@ void usage() {
         "      --models-dir DIR model directory (default: user data dir/models)\n"
         "      --record SEC     record SEC seconds from the microphone\n"
         "      --save-wav PATH  write the recorded audio to a wav file\n"
-        "      --fft NAME       mel FFT back-end: auto | internal | mkl\n"
         "      --dump-tokens    print token ids\n"
-        "      --install        установить копию приложения и включить автозапуск\n"
+        "      --install        установить копию приложения в профиль и включить автозапуск\n"
         "      --install-only   установить копию приложения без автозапуска\n"
         "      --uninstall      удалить автозапуск и установленные файлы\n"
         "      --uninstall-keep-files  удалить автозапуск, файлы оставить\n"
@@ -78,7 +72,6 @@ struct Args {
     int autostart = -1;  // -1 = not requested, 0 = off, 1 = on
     bool help = false;
     float record_sec = 0.0f;
-    std::string fft = "auto";
     std::string save_wav;
 };
 
@@ -118,7 +111,6 @@ bool parse_args(const std::vector<std::string> & args, Args * a) {
         }
         else if (s == "--record") { std::string v; if (!next(&v)) return false; a->record_sec = std::stof(v); }
         else if (s == "--save-wav") { if (!next(&a->save_wav)) return false; }
-        else if (s == "--fft") { if (!next(&a->fft)) return false; }
         else if (s == "-h" || s == "--help") a->help = true;
         else { std::fprintf(stderr, "unknown option: %s\n", s.c_str()); return false; }
     }
@@ -319,7 +311,10 @@ int cmd_mic(const Args & a) {
 }
 
 int cmd_install(const Args & a) {
-    const bool want_autostart = a.install && !a.install_only;
+    // An explicit --autostart always wins, so "--install --autostart off" cannot
+    // silently enable autostart.
+    bool want_autostart = a.install && !a.install_only;
+    if (a.autostart >= 0) want_autostart = a.autostart == 1;
     std::string err;
     if (!install_app(want_autostart, false, &err)) {
         std::fprintf(stderr, "установка не удалась: %s\n", err.c_str());
@@ -450,7 +445,6 @@ int run_cli(const std::vector<std::string> & args) {
         usage();
         return 0;
     }
-    if (!a.fft.empty()) set_fft_backend(a.fft);
     if (a.install_status) return cmd_install_status();
     if (a.install || a.install_only) return cmd_install(a);
     if (a.uninstall || a.uninstall_keep_files) return cmd_uninstall(a);

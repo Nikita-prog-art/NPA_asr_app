@@ -72,7 +72,6 @@ void Recognizer::update_mel() {
     const int frames = n < win ? 0 : (n - win) / hop + 1;
     if (frames <= mel_frames_) return;
     const int first = mel_frames_;
-    const int count = frames - first;
     mel_cache_.resize(static_cast<size_t>(frames) * mel_.config().n_mels);
     mel_.compute_frames(buffer_.data(), n, first, frames, mel_cache_.data() + static_cast<size_t>(first) * mel_.config().n_mels);
     mel_frames_ = frames;

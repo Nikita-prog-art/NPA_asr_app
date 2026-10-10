@@ -232,7 +232,6 @@ bool Encoder::run(const float * mel, int T_mel, std::vector<float> & out, int * 
             // linear biases are 1-D [out] (broadcast along ne0); conv biases need
             // the explicit [1, out] shape because their activation is [T, out]
             auto B1 = [&](const char * suffix) { return w32(p + suffix); };
-            auto B2 = [&](const char * suffix) { return w32_2d_auto(p + suffix); };
 
             // ---- FFN 1
             ggml_tensor * residual = x;

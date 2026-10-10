@@ -33,7 +33,8 @@ struct Diff {
     double got = 0, want = 0;
 };
 
-static void stats(const char * tag, const std::vector<float> & got, const float * want, size_t n) {
+[[maybe_unused]] static void stats(const char * tag, const std::vector<float> & got,
+                                   const float * want, size_t n) {
     double gmin = 1e30, gmax = -1e30, gsum = 0, wmin = 1e30, wmax = -1e30, wsum = 0;
     size_t gmaxi = 0, wmaxi = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -440,7 +441,8 @@ static int test_fft(int n) {
         maxe = std::max(maxe, std::fabs(double(out[k].real()) - ref[k].real()));
         maxe = std::max(maxe, std::fabs(double(out[k].imag()) - ref[k].imag()));
     }
-    std::printf("fft n=%d (mkl=%d): max abs err vs naive DFT = %.3e\n", n, (int) fft.using_mkl(), maxe);
+    std::printf("fft n=%d (%s): max abs err vs naive DFT = %.3e\n", n, fft_backend_name().c_str(),
+                maxe);
     return maxe < 1e-3 ? 0 : 1;
 }
 
@@ -458,9 +460,9 @@ static int test_bench(const std::string & model_path, const std::string & wav_pa
     std::printf("bench: %.2f s of audio, %d threads, %d iterations\n", audio_sec,
                 threads > 0 ? threads : (int) std::thread::hardware_concurrency(), iters);
 
-    const char * backends[] = {"mkl", "internal"};
-    for (const char * be : backends) {
-        set_fft_backend(be);
+    // A single FFT implementation now (the built-in Bluestein): this used to
+    // loop over "oneMKL" and "internal".
+    {
         RecognizerConfig cfg;
         cfg.model_path = model_path;
         cfg.n_threads = threads;
@@ -501,8 +503,8 @@ static int test_bench(const std::string & model_path, const std::string & wav_pa
         t1 = std::chrono::steady_clock::now();
         const double all_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
-        std::printf("  %-9s fft=%-22s mel %6.1f ms (%4.1f%%)  enc %7.1f ms (%4.1f%%)  total %7.1f ms  %5.1fx RT\n",
-                    be, fft_backend_name().c_str(), mel_ms, 100.0 * mel_ms / all_ms, enc_ms,
+        std::printf("  fft=%-18s mel %6.1f ms (%4.1f%%)  enc %7.1f ms (%4.1f%%)  total %7.1f ms  %5.1fx RT\n",
+                    fft_backend_name().c_str(), mel_ms, 100.0 * mel_ms / all_ms, enc_ms,
                     100.0 * enc_ms / all_ms, all_ms, audio_sec * 1000.0 / all_ms);
     }
     return 0;

@@ -294,12 +294,14 @@ bool write_text_file(const fs::path & p, const std::string & text, std::string *
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
             set_error(err, "не удалось записать " + path_str(tmp));
+            fs::remove(tmp, ec);
             return false;
         }
         f << text;
         f.flush();
         if (!f) {
             set_error(err, "не удалось записать " + path_str(tmp));
+            fs::remove(tmp, ec);
             return false;
         }
     }
@@ -327,7 +329,10 @@ bool read_install_json(nlohmann::json * out) {
         std::ifstream f(p);
         if (!f) return false;
         f >> *out;
-        return true;
+        // Anything the parser accepts (null, [], "x", 0) is not a usable state
+        // file: report "no flag yet" so the prompt is offered instead of being
+        // suppressed forever by a type_error in the callers.
+        return out->is_object();
     } catch (const std::exception &) {
         return false;
     }
@@ -350,11 +355,13 @@ void write_install_json(const nlohmann::json & j) {
 
 #if !defined(_WIN32)
 
-// freedesktop Exec quoting: the value may contain spaces.
+// freedesktop Exec quoting: the value may contain spaces, and the spec asks for
+// the double quote, backtick, dollar sign and backslash to be escaped inside a
+// quoted argument.  "%" is the field-code escape character.
 std::string exec_quote(const std::string & s) {
     std::string out = "\"";
     for (char c : s) {
-        if (c == '\\' || c == '"') out.push_back('\\');
+        if (c == '\\' || c == '"' || c == '$' || c == '`') out.push_back('\\');
         if (c == '%') {
             out += "%%";  // field-code escape
             continue;
@@ -365,12 +372,17 @@ std::string exec_quote(const std::string & s) {
     return out;
 }
 
+// Defined after the platform blocks; shared by both platforms.
+std::string exec_command(bool minimized);
+
 std::string desktop_entry(bool autostart) {
     std::string s;
     s += "[Desktop Entry]\n";
     s += "Type=Application\n";
     s += "Name=NPA ASR\n";
-    s += "Exec=" + autostart_command() + "\n";
+    // Only the autostart entry starts minimized; launching from the menu should
+    // show the window.
+    s += "Exec=" + exec_command(autostart) + "\n";
     if (autostart) {
         s += "X-GNOME-Autostart-enabled=true\n";
         s += "Terminal=false\n";
@@ -388,15 +400,27 @@ bool is_autostart_enabled() {
 bool dir_on_path(const std::string & dir) {
     const char * path = std::getenv("PATH");
     if (path == nullptr) return false;
-    std::string d = dir;
-    while (d.size() > 1 && d.back() == '/') d.pop_back();
+    const std::string home = platform::home_dir();
+    std::error_code want_ec;
+    const fs::path want = fs::weakly_canonical(path_from_utf8(dir), want_ec);
+    if (want_ec || want.empty()) return false;
+
     const std::string all(path);
     size_t start = 0;
     for (;;) {
         const size_t colon = all.find(':', start);
         std::string e = all.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
-        while (e.size() > 1 && e.back() == '/') e.pop_back();
-        if (!e.empty() && e == d) return true;
+        if (!e.empty()) {
+            // expand a leading ~ or $HOME the way a shell would
+            if (e[0] == '~' && (e.size() == 1 || e[1] == '/')) {
+                e = home + e.substr(1);
+            } else if (e.rfind("$HOME", 0) == 0) {
+                e = home + e.substr(5);
+            }
+            std::error_code ec;
+            const fs::path cand = fs::weakly_canonical(path_from_utf8(e), ec);
+            if (!ec && !cand.empty() && cand == want) return true;
+        }
         if (colon == std::string::npos) break;
         start = colon + 1;
     }
@@ -418,21 +442,33 @@ bool is_autostart_enabled() {
     DWORD size = 0;
     const LSTATUS st = RegQueryValueExW(key, kRunValue, nullptr, &type, nullptr, &size);
     RegCloseKey(key);
-    return st == ERROR_SUCCESS;
+    // Only a non-empty string value is a usable autostart command; a leftover of
+    // another type must not be reported as "autostart is on".
+    const bool string_value = type == REG_SZ || type == REG_EXPAND_SZ;
+    return st == ERROR_SUCCESS && string_value && size > sizeof(wchar_t);
 }
 
 #endif  // _WIN32
+
+// Command line that launches the installed copy.  The autostart entry starts it
+// minimized; the menu entry shows the window.
+std::string exec_command(bool minimized) {
+    const std::string exe = path_str(install_exe_path());
+#if defined(_WIN32)
+    std::string cmd = "\"" + exe + "\"";
+#else
+    std::string cmd = exec_quote(exe);
+#endif
+    if (minimized) cmd += " --minimized";
+    return cmd;
+}
 
 }  // namespace
 
 // ---------------------------------------------------------------- public API
 
 std::string autostart_command() {
-#if defined(_WIN32)
-    return "\"" + path_str(install_exe_path()) + "\" --minimized";
-#else
-    return exec_quote(path_str(install_exe_path())) + " --minimized";
-#endif
+    return exec_command(true);
 }
 
 InstallStatus install_status() {
@@ -458,7 +494,11 @@ InstallStatus install_status() {
             ec.clear();
             const uintmax_t b = fs::file_size(self, ec);
             if (!ec && a == b) {
-                st.up_to_date = file_digest(self) == file_digest(install_exe_path());
+                // An unreadable file yields an empty digest: never treat that as
+                // "the same build".
+                const std::string da = file_digest(self);
+                const std::string db = file_digest(install_exe_path());
+                st.up_to_date = !da.empty() && da == db;
             }
         }
 
@@ -527,35 +567,46 @@ bool uninstall_app(bool keep_files, std::string * err) {
         bool ok = true;
         std::string first_err;
 
-        // Autostart is always removed, even when the files are kept.
+        // Uninstalling always unregisters the application (autostart entry and,
+        // on Linux, the menu entry); keep_files only decides whether the
+        // installed executable itself is deleted.
         std::string aerr;
         if (!set_autostart(false, &aerr)) {
             ok = false;
             first_err = aerr;
         }
 
+        std::error_code ec;
+#if !defined(_WIN32)
+        const fs::path menu = menu_desktop_path();
+        if (!menu.empty()) {
+            fs::remove(menu, ec);
+            if (ec) {
+                ok = false;
+                if (first_err.empty()) {
+                    first_err = "не удалось удалить " + path_str(menu) + ": " + ec.message();
+                }
+            }
+        }
+#endif
+
         if (!keep_files) {
-            std::error_code ec;
             const fs::path dst = install_exe_path();
             if (!dst.empty()) {
+                ec.clear();
                 fs::remove(dst, ec);
                 if (ec) {
                     ok = false;
                     if (first_err.empty()) {
                         first_err = "не удалось удалить " + path_str(dst) + ": " + ec.message();
+#if defined(_WIN32)
+                        if (same_file(path_from_utf8(platform::exe_path()), dst)) {
+                            first_err += " (приложение запущено из этой копии: закройте его и удалите файл вручную)";
+                        }
+#endif
                     }
                 }
             }
-#if !defined(_WIN32)
-            const fs::path menu = menu_desktop_path();
-            if (!menu.empty()) {
-                ec.clear();
-                fs::remove(menu, ec);
-                if (ec && first_err.empty()) {
-                    first_err = "не удалось удалить " + path_str(menu) + ": " + ec.message();
-                }
-            }
-#endif
         }
 
         if (!ok) {
@@ -574,6 +625,17 @@ bool uninstall_app(bool keep_files, std::string * err) {
 
 bool set_autostart(bool on, std::string * err) {
     try {
+        if (on) {
+            // An autostart entry that points at nothing is worse than no entry:
+            // it silently does nothing on the next login.
+            const fs::path target = install_exe_path();
+            if (target.empty() || !file_exists(target)) {
+                set_error(err, "сначала установите приложение (npa_asr --install): " +
+                                   (target.empty() ? std::string("путь установки не определён")
+                                                   : path_str(target) + " не найден"));
+                return false;
+            }
+        }
 #if defined(_WIN32)
         if (on) {
             const std::wstring data = to_wide(autostart_command());

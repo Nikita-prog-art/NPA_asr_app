@@ -23,7 +23,10 @@ struct Settings {
     OutputMode output_mode = OutputMode::InsertAndClipboard;
     float step_sec = 1.0f;               // streaming re-encode interval
     float max_window_sec = 20.0f;        // sliding window length
-    bool always_on_top = true;
+    // Off by default: a window that floats above everything else never gets out
+    // of the way when the user switches to the application they dictate into.
+    bool always_on_top = false;
+    float ui_scale = 0.0f;               // 0 = follow the monitor DPI
     bool sound_on_done = false;
 
     // Loads from <user_data_dir>/settings.json, falling back to the defaults.
