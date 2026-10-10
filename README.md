@@ -12,12 +12,17 @@ libtorch в рантайме.
 * **Скачивание модели** нужного уровня квантизации прямо из приложения (или
   указание пути к своему `.gguf`).
 * Финальный текст **вставляется в активное окно** и дублируется в буфер обмена.
-* Таргет под архитектуру процессора (например `alderlake`: AVX2 + AVX-VNNI) с
-  рантайм-фолбеком на `haswell`/`sandybridge`/`sse42`/`x64` — через
-  `GGML_CPU_ALL_VARIANTS` + динамические бэкенды ggml.
-* Сборка с Intel oneAPI (`~/dists/intel/oneapi`,
-  `C:\Program Files (x86)\Intel\oneAPI`): компилятор `icx/icpx` и oneMKL DFTI для
-  FFT мел-спектрограммы (с автоматическим фолбеком на собственный FFT).
+* **Один самодостаточный исполняемый файл**: всё, что мы собираем сами (ggml,
+  imgui, glfw, ядро распознавания), линкуется статически; на Windows это ещё и
+  статический CRT (`/MT`), поэтому VC++ Redistributable не нужен. На Linux
+  остаются только системные библиотеки (libX11/libGL/libcurl).
+* Таргет под архитектуру процессора с фолбеком: по умолчанию `ASR_CPU_ARCH=x86-64-v3`
+  (AVX2/FMA/F16C/BMI2 — любой Intel с 2013 г. и любой AMD Zen), `ASR_CPU_ARCH=native`
+  — максимум для машины сборки, `x86-64-v2`/`x86-64` — для старого железа.
+  Если CPU не умеет нужное, приложение печатает понятную ошибку вместо SIGILL.
+* **Масштаб интерфейса**: автоматически по DPI монитора (per-monitor v2 на
+  Windows) плюс ручной `Ctrl +` / `Ctrl -` / `Ctrl 0` (шаг 5 %).
+* **Установка в профиль и автозапуск** одной кнопкой (`--install`).
 
 ---
 
@@ -49,8 +54,24 @@ libtorch в рантайме.
   → Запиши встречу на 15 марта в 14:30.
 ```
 
-Скорость на i9-13900HK (8 потоков, `f16`): **~10–12× реального времени**
-(≈ 380–780 мс на 4–9 с аудио), модель 222.5M параметров, 445 МБ в `f16`.
+Скорость на i9-13900HK (8 потоков, `f16`, статическая сборка `x86-64-v3`):
+**~10× реального времени** — 903 мс на 8.98 с аудио (Linux) и 902 мс (Windows),
+мел-фронтенд ~30 мс (3 %), энкодер ~810 мс (90 %). Модель 222.5M параметров,
+445 МБ в `f16`.
+
+Что даёт и что не даёт выбор ISA и OpenMP (тот же файл 8.98 с, 8 потоков,
+`asr_test bench`, 3 итерации):
+
+| Сборка | энкодер | всего | ×RT |
+|---|---|---|---|
+| `x86-64-v3` (по умолчанию), без OpenMP | 801–815 мс | 903–930 мс | 9.7–9.9 |
+| `x86-64-v3` + `ASR_OPENMP=ON` | 789–822 мс | 864–913 мс | 9.8–10.4 |
+| `native` (AVX2 + AVX-VNNI этого CPU) | 795–834 мс | 902–943 мс | 9.5–10.0 |
+| старая динамическая сборка (`alderlake` + OpenMP) | 857 мс | 896 мс | 10.0 |
+
+Разница внутри шума: `-march=native` и OpenMP не дают ничего заметного (AVX-VNNI
+ускоряет только целочисленные `q8_0`/`q4_0`-ядра, а модель по умолчанию `f16`),
+поэтому по умолчанию — переносимый `x86-64-v3` без лишних зависимостей.
 
 ---
 
@@ -95,36 +116,37 @@ whisper-stream):
 ### Linux
 
 ```bash
-scripts/build_linux.sh              # gcc по умолчанию; ASR_COMPILER=icx — с icx/icpx
-ASR_MKL_FFT=ON scripts/build_linux.sh  # + oneMKL DFTI для мел-FFT (см. ниже)
-ASR_NATIVE=ON scripts/build_linux.sh   # один бинарник под этот CPU (быстрее, без фолбека)
+scripts/build_linux.sh                 # gcc, статический бинарник build/bin/npa_asr
+ASR_CPU_ARCH=native scripts/build_linux.sh  # максимум для этой машины (без фолбека)
+ASR_CPU_ARCH=x86-64-v2 scripts/build_linux.sh  # для CPU до 2013 года
 ASR_JOBS=6 scripts/build_linux.sh      # ограничить параллелизм (см. про память ниже)
 ```
 
-oneAPI подхватывается (`source ~/dists/intel/oneapi/setvars.sh --force`)
-**только** если запрошен `ASR_COMPILER=icx` или `ASR_MKL_FFT=ON`;
-по умолчанию сборка от oneAPI не зависит. Результат: `build/bin/npa_asr`.
+Результат — **один файл** `build/bin/npa_asr`; рядом никаких `.so` не появляется
+(`ldd` показывает только системные библиотеки).
 
-Зависимости: `cmake`, `ninja`, `libx11-dev`, `libxtst-dev`,
-`libgl1-mesa-dev`, `libcurl4-openssl-dev` (последние два — для GUI и
-загрузчика; ggml/miniaudio/imgui/glfw скачиваются CMake-ом автоматически,
+Зависимости: `cmake`, `ninja`, `libx11-dev`, `libxtst-dev`, `libxrandr-dev`,
+`libxinerama-dev`, `libxcursor-dev`, `libgl1-mesa-dev`, `libcurl4-openssl-dev`
+(ggml/miniaudio/imgui/glfw скачиваются CMake-ом автоматически,
 `-DASR_FETCH_DEPS=OFF` — если хотите положить их руками).
+`-DASR_LIBCURL=OFF` убирает и libcurl: загрузка моделей тогда идёт через
+внешний `curl`/`wget`, а список динамических зависимостей сжимается до
+X11/OpenGL/libc.
 
 ### Windows
 
 ```cmd
-scripts\build_windows.cmd            :: MSVC + oneAPI (oneMKL, Intel OpenMP)
-set ASR_COMPILER=icx && scripts\build_windows.cmd
-set ASR_MKL_FFT=ON && scripts\build_windows.cmd
+scripts\build_windows.cmd              :: MSVC, статический npa_asr.exe
+set ASR_CPU_ARCH=native && scripts\build_windows.cmd
 set ASR_NATIVE=ON && scripts\build_windows.cmd
 ```
 
-Скрипт находит Visual Studio через `vswhere`, подхватывает
-`C:\Program Files (x86)\Intel\oneAPI\setvars.bat` (только если запрошен icx или
-oneMKL) и собирает `build-windows\bin\npa_asr.exe`. Рядом с exe должны лежать
-`ggml-cpu-*.dll` — именно они дают рантайм-выбор варианта CPU; GLFW
-линкуется статически, так что больше никаких DLL не требуется. Готовые сборки
-(Windows/Linux) собираются в CI: `.github/workflows/build.yml`.
+Скрипт находит Visual Studio через `vswhere` и собирает
+`build-windows\bin\npa_asr.exe`. Рядом с exe **не нужно ничего**: ggml, GLFW и
+CRT вкомпилированы (проверяется `dumpbin /dependents` — только системные
+`KERNEL32/USER32/GDI32/OPENGL32/WINHTTP/...`). Релизы собираются в CI:
+`.github/workflows/release.yml` (по тегу `v*`), ручная сборка ветки —
+`build.yml` (только `workflow_dispatch`, чтобы не гонять CI на каждый пуш).
 
 Если разработка идёт в WSL (как у автора), удобнее собрать Windows-версию
 оттуда — MSVC не умеет работать по UNC-пути, поэтому скрипт упаковывает исходники
@@ -134,10 +156,12 @@ oneMKL) и собирает `build-windows\bin\npa_asr.exe`. Рядом с exe �
 scripts/build_windows_from_wsl.sh          # WIN_BUILD_DIR=C:\dists\builds\npa_asr_build
 ```
 
-### oneAPI: что он реально даёт
+### Почему без oneAPI и без рантайм-диспатча ggml
 
-Измерено на i9-13900HK (8 потоков, `asr_test bench`, файл 8.98 с; gcc-бинарь
-запускался без `LD_LIBRARY_PATH` oneAPI, icx — со своими runtime-библиотеками):
+oneAPI/oneMKL из проекта убран (вместе с `cmake/oneapi.cmake`, `ASR_MKL_FFT` и
+`ASR_COMPILER=icx`). Измерено на i9-13900HK (8 потоков, `asr_test bench`, файл
+8.98 с; gcc-бинарь запускался без `LD_LIBRARY_PATH` oneAPI, icx — со своими
+runtime-библиотеками):
 
 | Сборка | мел-фронтенд | энкодер (10 итераций × 3 прогона) | всё распознавание |
 |---|---|---|---|
@@ -145,25 +169,25 @@ scripts/build_windows_from_wsl.sh          # WIN_BUILD_DIR=C:\dists\builds\npa_a
 | gcc 14 + свой FFT (Bluestein) | 35.4 мс (3.8 %) | 857 мс | 923 мс (9.7× RT) |
 | icx/icpx 2025.3 + Intel OpenMP | 28–31 мс | 876 мс (840–910) | 1015 мс (8.8× RT) |
 
-Выводы:
-
 * **oneMKL ускоряет только FFT, а FFT — это ~4 % времени**, то есть итоговый
-  выигрыш ≈ 0.2 % (разница в энкодере — шум). При этом линковка oneMKL тянет
-  зависимость от окружения oneAPI в рантайме: на Windows exe без `setvars.bat`
-  падал с «не обнаружена mkl_rt.2.dll», на Linux в процесс отображается ~100 МБ
-  библиотек MKL. Поэтому `ASR_MKL_FFT=OFF` по умолчанию: свой FFT (Bluestein
-  поверх radix-2) даёт ту же точность (проверено: `max_abs = 4.1e-05` против
-  `torchaudio`) и не тянет зависимостей.
+  выигрыш ≈ 0.2 %. При этом линковка oneMKL тянет зависимость от окружения
+  oneAPI в рантайме: на Windows exe без `setvars.bat` падал с «не обнаружена
+  mkl_rt.2.dll», на Linux в процесс отображается ~100 МБ библиотек MKL.
 * **icx/icpx + Intel OpenMP не быстрее gcc 14** (скорее на ~2 % медленнее и
-  заметно менее стабилен по времени). Это ожидаемо: ядра ggml написаны
-  интринсиками вручную, компилятору почти нечего улучшать. Поэтому по умолчанию
-  собираем gcc/MSVC, а `ASR_COMPILER=icx` остаётся опцией.
-* `--fft internal|mkl|auto` переключает FFT-бэкенд в рантайме,
-  `npa_asr --info` показывает текущий и список доступных вариантов CPU.
+  заметно менее стабилен по времени): ядра ggml написаны интринсиками вручную,
+  компилятору почти нечего улучшать.
+* **Рантайм-диспатч ggml (`GGML_CPU_ALL_VARIANTS` + `GGML_BACKEND_DL`) убран
+  вместе с динамической линковкой**: он требовал 14 файлов `ggml-cpu-*.so/.dll`
+  рядом с exe, что несовместимо с «одним статическим файлом». Вместо него ISA
+  фиксируется на этапе конфигурации (`ASR_CPU_ARCH`). Для `f16`-модели разницы
+  между вариантами `alderlake` и `haswell` практически нет — AVX-VNNI ускоряет
+  только целочисленные (`q8_0`/`q4_0`) скалярные произведения.
+* **OpenMP тоже убран** (`ASR_OPENMP=OFF`): ggml использует собственный пул
+  потоков, libgomp/vcomp140.dll в зависимостях не появляется, а по скорости
+  вариант с OpenMP не выигрывает (см. замеры в разделе про производительность).
 
 Реальные рычаги производительности — число потоков (`--threads`, в GUI ползунок)
-и `ASR_NATIVE=ON` (сборка под конкретный CPU без динамических бэкендов, но и без
-фолбека).
+и `ASR_CPU_ARCH=native` (сборка под конкретный CPU).
 
 ### Про память при сборке
 
@@ -226,6 +250,23 @@ swap=8GB
 кладётся в буфер обмена (режим вывода настраивается: в окно + буфер / только
 буфер / только в окне).
 
+**Масштаб интерфейса.** По умолчанию окно подстраивается под DPI монитора
+(на Windows приложение объявлено per-monitor-DPI-aware через манифест, поэтому
+при 125 %/150 % интерфейс остаётся резким, а не растянутым). Вручную:
+`Ctrl +` / `Ctrl -` (шаг 5 %), `Ctrl 0` — вернуться к автомату; то же самое
+есть в «Настройки» → «Окно и оформление» (кнопки `-`/`+` и галочка «авто»).
+Выбранное значение сохраняется в `settings.json`.
+
+**Поведение окна.** «Поверх остальных окон» по умолчанию **выключено**: иначе
+окно висело над всеми приложениями и не уходило с дороги, когда вы переключаетесь
+в редактор, куда диктуете.
+
+**Установка.** При первом запуске приложение предлагает скопировать себя в
+личную папку и добавить в автозагрузку; позже то же самое доступно на вкладке
+«О программе» → «Установка» (или флагами `--install`, `--uninstall`,
+`--autostart on|off`, `--install-status`). Подробности — в разделе
+[«Установка и автозапуск»](#установка-и-автозапуск).
+
 ### CLI
 
 ```bash
@@ -235,7 +276,8 @@ npa_asr -m model.gguf --mic                 # push-to-talk без GUI
 npa_asr --list-devices                      # устройства захвата
 npa_asr --list-models                       # локальные .gguf
 npa_asr --download --quant q8_0             # скачать модель из релиза
-npa_asr --info                              # какой ggml-бэкенд/CPU выбран
+npa_asr --info                              # CPU-базлайн, потоки, каталоги
+npa_asr --install-status                    # состояние установки/автозапуска
 ```
 
 ### Горячие клавиши на Linux
@@ -254,17 +296,17 @@ npa_asr --info                              # какой ggml-бэкенд/CPU �
 ## 6. Структура репозитория
 
 ```
-CMakeLists.txt              сборка (опции ASR_GUI/ASR_NATIVE/ASR_MKL_FFT/ASR_FETCH_DEPS)
-cmake/oneapi.cmake          поиск oneAPI/oneMKL, выбор FFT
+CMakeLists.txt              сборка (ASR_GUI/ASR_TOOLS/ASR_CPU_ARCH/ASR_NATIVE/ASR_OPENMP/ASR_LIBCURL/ASR_FETCH_DEPS)
 cmake/deps.cmake            пины и загрузка ggml/imgui/glfw/miniaudio/json
-src/core/                   мел-фронтенд, FFT, энкодер, RNN-T, токенизатор, распознаватель
+cmake/npa_asr.manifest      манифест Windows: per-monitor DPI, long paths, asInvoker
+src/core/                   мел-фронтенд, FFT (Bluestein), энкодер, RNN-T, токенизатор, распознаватель
 src/audio/                  захват с микрофона (miniaudio) и чтение файлов
 src/platform/               глобальный хоткей, буфер обмена, вставка текста (Win32 / X11 / evdev)
-src/net/                    загрузка моделей (WinHTTP / libcurl), SHA-256, манифест
-src/app/                    настройки, менеджер моделей, контроллер, GUI, CLI
+src/net/                    загрузка моделей (WinHTTP / libcurl или curl/wget), SHA-256, манифест
+src/app/                    настройки, установка/автозапуск, менеджер моделей, контроллер, GUI, CLI
 tools/                      конвертер в GGUF, генераторы эталонов, тесты
 scripts/                    сборка под Linux/Windows
-.github/workflows/          сборка приложения и конвертация модели в GGUF
+.github/workflows/          build.yml (вручную), release.yml (по тегу v*), convert-model.yml (один раз)
 ```
 
 Тесты и эталоны (нужен Python-venv с torch). `ref_gigaam.py` прогоняет
@@ -295,8 +337,10 @@ python -m venv .venv && .venv/bin/pip install torch --index-url https://download
 * [ggml](https://github.com/ggml-org/ggml) (MIT) — ядро инференса;
 * [miniaudio](https://github.com/mackron/miniaudio) (public domain / MIT-0) — звук;
 * [Dear ImGui](https://github.com/ocornut/imgui) (MIT) + [GLFW](https://www.glfw.org/) (zlib) — интерфейс;
-* [nlohmann/json](https://github.com/nlohmann/json) (MIT) — настройки и манифест;
-* [oneMKL](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) — FFT (опционально).
+* [nlohmann/json](https://github.com/nlohmann/json) (MIT) — настройки и манифест.
+
+oneMKL и компиляторы Intel в итоговой сборке не используются (измерения и
+причины — в разделе «Почему без oneAPI»), но спасибо им за этап сравнения.
 
 ---
 
