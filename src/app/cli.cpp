@@ -38,7 +38,7 @@ void usage() {
         "  npa_asr -m MODEL.gguf --mic      headless push-to-talk (hotkey)\n"
         "  npa_asr --list-devices           list capture devices\n"
         "  npa_asr --list-models            list local .gguf models\n"
-        "  npa_asr --download ID --quant Q  download a published model\n"
+        "  npa_asr --download ID --quant Q  download a published model (default: recommended)\n"
         "  npa_asr -m MODEL.gguf --record 5   record 5 s from the microphone and transcribe\n"
         "  npa_asr --manifest               show the model catalogue\n"
         "  npa_asr --info                   backend / CPU information\n"
@@ -171,7 +171,8 @@ int cmd_manifest() {
     for (const auto & e : m.models) {
         std::printf("%s  (%s)\n", e.name.c_str(), e.id.c_str());
         for (const auto & f : e.files) {
-            std::printf("   %-8s %8.1f MB  %s\n", f.quant.c_str(), f.size / 1e6, f.url.c_str());
+            std::printf("   %-8s %8.1f MB  %s%s\n", f.quant.c_str(), f.size / 1e6, f.url.c_str(),
+                        f.recommended ? "  [рекомендуется]" : "");
         }
     }
     return 0;
@@ -190,7 +191,15 @@ int cmd_download(const Args & a) {
         std::fprintf(stderr, "unknown model id: %s\n", id.c_str());
         return 1;
     }
-    const std::string quant = a.quant.empty() ? "f16" : a.quant;
+    // Without --quant, take what the catalogue recommends (q4_0 today), and
+    // only fall back to the largest file when nothing is marked.
+    std::string quant = a.quant;
+    if (quant.empty()) {
+        for (const auto & candidate : e->files) {
+            if (candidate.recommended) quant = candidate.quant;
+        }
+        if (quant.empty()) quant = "f16";
+    }
     const asr::net::ModelFile * f = e->file(quant);
     if (!f) {
         std::fprintf(stderr, "quant %s is not published for %s\n", quant.c_str(), id.c_str());
