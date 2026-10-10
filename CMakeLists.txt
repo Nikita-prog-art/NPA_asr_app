@@ -3,6 +3,35 @@ project(npa_asr_app LANGUAGES C CXX)
 
 set(ASR_VERSION "0.1.0" CACHE STRING "application version")
 
+# ---------------------------------------------------------------- build id
+# The source revision embedded in the binary (src/app/build_info.cpp).  The
+# application uses it to tell builds apart: it offers to update an installed
+# copy when the revision differs, and stays quiet when the same revision is
+# just rebuilt.  Pass -DASR_BUILD_ID=... when the sources were exported without
+# .git (scripts/build_windows_from_wsl.sh does that, since MSVC cannot compile
+# from a UNC path and the sources travel to Windows as a tarball).
+set(ASR_BUILD_ID "" CACHE STRING "source revision embedded in the binary")
+if(NOT ASR_BUILD_ID)
+  execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --short HEAD
+                  OUTPUT_VARIABLE ASR_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE ASR_GIT_RC)
+  if(ASR_GIT_RC EQUAL 0 AND ASR_GIT_REV)
+    set(ASR_BUILD_ID "${ASR_GIT_REV}")
+    # Local modifications are a different build as well: mark them.  Untracked
+    # files are ignored, so build directories and helper scripts do not count.
+    execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" status --porcelain --untracked-files=no
+                    OUTPUT_VARIABLE ASR_GIT_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE ASR_GIT_RC)
+    if(ASR_GIT_RC EQUAL 0 AND ASR_GIT_DIRTY)
+      set(ASR_BUILD_ID "${ASR_BUILD_ID}-dirty")
+    endif()
+  else()
+    set(ASR_BUILD_ID "${ASR_VERSION}")
+    message(STATUS "build id: git not available, using the version ${ASR_BUILD_ID}")
+  endif()
+endif()
+message(STATUS "build id: ${ASR_BUILD_ID}")
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "build type" FORCE)
 endif()
@@ -160,6 +189,13 @@ add_library(asr_core STATIC ${ASR_SOURCES})
 target_include_directories(asr_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+# The revision is a generated header rather than a target-wide definition so
+# that a new commit recompiles src/app/build_info.cpp only.  configure_file()
+# leaves the file (and therefore the build) alone while the value is unchanged.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.h.in
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/npa_asr_build_id.h @ONLY)
+target_include_directories(asr_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(asr_core PUBLIC ggml)
 target_compile_definitions(asr_core PUBLIC
   ASR_VERSION="${ASR_VERSION}"
