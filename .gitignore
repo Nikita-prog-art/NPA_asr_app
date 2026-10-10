@@ -88,3 +88,6 @@ models/*
 .uv-cache/
 logs/
 *.gguf
+
+# parallel work trees used while developing
+.wt/
