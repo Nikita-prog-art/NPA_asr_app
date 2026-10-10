@@ -101,7 +101,9 @@ double now_seconds() {
 }
 
 float clamp_scale(float scale) {
-    return std::max(0.75f, std::min(3.0f, scale));
+    // 2x is already a very large interface; beyond that the fixed two-panel
+    // layout no longer fits on any screen.
+    return std::max(0.75f, std::min(2.0f, scale));
 }
 
 // The scale the window's monitor asks for (1.25 at "125%" on Windows, usually
@@ -277,17 +279,50 @@ void apply_theme(bool dark) {
     }
 }
 
-// Applies the theme and then the interface scale.  ScaleAllSizes() multiplies
-// the style in place, so the style has to be rebuilt from scratch every time the
-// scale changes (a monitor with a different DPI, or Ctrl +/-).
+// Applies the theme and then the interface scale.
+//
+// ScaleAllSizes() multiplies the style *in place*, and apply_theme() only
+// restores the colours plus a handful of sizes, so the style has to be reset to
+// the library defaults first: scaling an already scaled style compounds and the
+// interface grows on every theme toggle or Ctrl +/- press.
 void apply_style(bool dark, float scale) {
+    ImGuiStyle & s = ImGui::GetStyle();
+    s = ImGuiStyle{};
     apply_theme(dark);
     if (!(scale > 0.0f)) return;
-    ImGuiStyle & s = ImGui::GetStyle();
     s.ScaleAllSizes(scale);
     // ImGui 1.92 rasterises fonts on demand at FontSizeBase * FontScaleDpi, so
     // the glyphs stay crisp instead of being scaled up as a texture.
     s.FontScaleDpi = scale;
+}
+
+// Keeps the layout space constant when the interface scale changes: the window
+// grows (or shrinks) with it, up to the work area of its monitor.  Without this
+// the scaled widgets do not fit into the window they were laid out for.
+void resize_window_for_scale(GLFWwindow * window, float from, float to) {
+    if (window == nullptr || !(from > 0.0f) || !(to > 0.0f)) return;
+    int w = 0;
+    int h = 0;
+    glfwGetWindowSize(window, &w, &h);
+    if (w <= 0 || h <= 0) return;
+
+    const double f = static_cast<double>(to) / static_cast<double>(from);
+    int nw = static_cast<int>(std::lround(w * f));
+    int nh = static_cast<int>(std::lround(h * f));
+
+    GLFWmonitor * mon = glfwGetWindowMonitor(window);
+    if (mon == nullptr) mon = glfwGetPrimaryMonitor();
+    int mx = 0, my = 0, mw = 0, mh = 0;
+    if (mon != nullptr) {
+        glfwGetMonitorWorkarea(mon, &mx, &my, &mw, &mh);
+        if (mw > 0 && nw > mw) nw = mw;
+        if (mh > 0 && nh > mh) nh = mh;
+    }
+    glfwSetWindowSize(window, nw, nh);
+    // the minimum size is in screen coordinates, i.e. it has to follow the scale
+    glfwSetWindowSizeLimits(window, static_cast<int>(std::lround(720.0f * to)),
+                            static_cast<int>(std::lround(480.0f * to)),
+                            GLFW_DONT_CARE, GLFW_DONT_CARE);
 }
 
 // ------------------------------------------------------------------ state
@@ -1133,11 +1168,16 @@ void draw_log_tab(GuiState & ui) {
     ImGui::SameLine();
     ImGui::TextDisabled("сообщений: %d", static_cast<int>(ui.log_lines.size()));
 
-    ImGui::BeginChild("log_child", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders,
-                      ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::BeginChild("log_child", ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders);
     const bool at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
-    ImGui::PushFont(ui.font_mono, 0.0f);
+    // PushFont(font, 0.0f) means "keep the current size" in ImGui 1.92, which
+    // would render the monospace font at the regular font's size; passing the
+    // font's own LegacySize is the documented way to get the size it was loaded
+    // with.
+    ImGui::PushFont(ui.font_mono, ui.font_mono != nullptr ? ui.font_mono->LegacySize : 0.0f);
+    ImGui::PushTextWrapPos(0.0f);  // long paths and URLs must wrap, not scroll
     for (const std::string & line : ui.log_lines) ImGui::TextUnformatted(line.c_str());
+    ImGui::PopTextWrapPos();
     ImGui::PopFont();
     if (ui.log_lines.empty()) ImGui::TextDisabled("Журнал пуст.");
     if (at_bottom) ImGui::SetScrollHereY(1.0f);
@@ -1357,27 +1397,39 @@ void poll_background(GuiState & ui, Controller & controller) {
     }
 }
 
-void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
-    // ---- interface scale: monitor DPI, the explicit override and Ctrl +/-
+// Applies the theme/scale and, when the user changed the scale explicitly, the
+// matching window size.  Must run *before* ImGui::NewFrame() so that the frame
+// is laid out with the new style.
+void update_interface_scale(GuiState & ui, GLFWwindow * window) {
     const float monitor = monitor_scale(window);
     const bool monitor_changed = std::fabs(monitor - ui.monitor_scale_now) > 0.001f;
     ui.monitor_scale_now = monitor;
 
-    if (!ui.theme_applied || ui.scale_pending || monitor_changed) {
-        const bool first = !ui.theme_applied;
-        const float wanted =
-            ui.settings.ui_scale > 0.0f ? clamp_scale(ui.settings.ui_scale) : monitor;
-        apply_style(ui.settings.dark_theme, wanted);
-        if (!first && std::fabs(wanted - ui.ui_scale) > 0.001f) {
-            ui.scale_toast = "масштаб интерфейса: " +
-                             std::to_string(static_cast<int>(std::lround(wanted * 100.0f))) + " %";
-            ui.scale_toast_until = now_seconds() + 1.5;
-        }
-        ui.ui_scale = wanted;
-        ui.scale_pending = false;
-        if (first) set_always_on_top(window, ui.always_on_top);
-        ui.theme_applied = true;
+    if (ui.theme_applied && !ui.scale_pending && !monitor_changed) return;
+
+    const bool first = !ui.theme_applied;
+    const float previous = ui.ui_scale;
+    const float wanted =
+        ui.settings.ui_scale > 0.0f ? clamp_scale(ui.settings.ui_scale) : monitor;
+
+    if (!first && std::fabs(wanted - previous) > 0.001f) {
+        resize_window_for_scale(window, previous, wanted);
     }
+
+    apply_style(ui.settings.dark_theme, wanted);
+
+    if (!first && std::fabs(wanted - previous) > 0.001f) {
+        ui.scale_toast = "масштаб интерфейса: " +
+                         std::to_string(static_cast<int>(std::lround(wanted * 100.0f))) + " %";
+        ui.scale_toast_until = now_seconds() + 1.5;
+    }
+    ui.ui_scale = wanted;
+    ui.scale_pending = false;
+    if (first) set_always_on_top(window, ui.always_on_top);
+    ui.theme_applied = true;
+}
+
+void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
 
     const AppStatus st = controller.status();  // one snapshot per frame
 
@@ -1403,10 +1455,13 @@ void draw_frame(GuiState & ui, Controller & controller, GLFWwindow * window) {
     ImGui::PopStyleVar(3);
 
     const float available_w = ImGui::GetContentRegionAvail().x;
+    // The panel minimums are in logical pixels but the widgets inside them are
+    // scaled, so they have to follow the interface scale.
+    const float panel_scale = ui.ui_scale > 0.0f ? ui.ui_scale : 1.0f;
     float right_w = available_w * 0.44f;
-    if (right_w < 380.0f) right_w = 380.0f;
-    if (right_w > available_w - 320.0f) right_w = available_w - 320.0f;
-    if (right_w < 320.0f) right_w = 320.0f;
+    if (right_w < 380.0f * panel_scale) right_w = 380.0f * panel_scale;
+    if (right_w > available_w - 320.0f * panel_scale) right_w = available_w - 320.0f * panel_scale;
+    if (right_w < 320.0f * panel_scale) right_w = 320.0f * panel_scale;
     const float left_w = available_w - right_w - ImGui::GetStyle().ItemSpacing.x;
 
     ImGui::BeginChild("main_panel", ImVec2(left_w, 0.0f), ImGuiChildFlags_Borders);
@@ -1577,6 +1632,8 @@ int run_gui(bool minimized) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         poll_background(ui, controller);
+        // before NewFrame: the theme/scale and the window size they need
+        update_interface_scale(ui, window);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
