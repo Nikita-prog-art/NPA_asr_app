@@ -198,7 +198,7 @@ std::string home_dir() {
 #endif
 }
 
-std::string exe_dir() {
+std::string exe_path() {
 #if defined(_WIN32)
     // GetModuleFileNameW truncates instead of returning the needed size; retry
     // with a bigger buffer while the long-path support is uncertain.
@@ -207,12 +207,7 @@ std::string exe_dir() {
         const DWORD n = GetModuleFileNameW(nullptr, buf.data(),
                                            static_cast<DWORD>(buf.size()));
         if (n == 0) return std::string();
-        if (n < buf.size()) {
-            std::wstring w(buf.data(), n);
-            const size_t slash = w.find_last_of(L"\\/");
-            if (slash != std::wstring::npos) w.resize(slash);
-            return utf16_to_utf8(w);
-        }
+        if (n < buf.size()) return utf16_to_utf8(std::wstring(buf.data(), n));
         buf.resize(buf.size() * 2);
     }
 #elif defined(__APPLE__)
@@ -220,17 +215,20 @@ std::string exe_dir() {
     _NSGetExecutablePath(nullptr, &size);  // fails on purpose, sets the needed size
     std::vector<char> buf(static_cast<size_t>(size) + 1, '\0');
     if (_NSGetExecutablePath(buf.data(), &size) != 0) return std::string();
-    std::string p(buf.data());
-    const size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? std::string() : p.substr(0, slash);
+    return std::string(buf.data());
 #else
     char buf[4096];
     const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n <= 0) return std::string();
-    const std::string p(buf, static_cast<size_t>(n));
-    const size_t slash = p.find_last_of('/');
-    return slash == std::string::npos ? std::string() : p.substr(0, slash);
+    return std::string(buf, static_cast<size_t>(n));
 #endif
+}
+
+std::string exe_dir() {
+    const std::string p = exe_path();
+    if (p.empty()) return std::string();
+    const size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? std::string() : p.substr(0, slash);
 }
 
 }  // namespace asr::platform

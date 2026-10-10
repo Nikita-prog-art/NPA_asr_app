@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "app/controller.h"
+#include "app/install.h"
 #include "app/models.h"
 #include "app/settings.h"
 #include "audio/audio_file.h"
@@ -39,6 +40,12 @@ void usage() {
         "  npa_asr -m MODEL.gguf --record 5   record 5 s from the microphone and transcribe\n"
         "  npa_asr --manifest               show the model catalogue\n"
         "  npa_asr --info                   backend / CPU information\n"
+        "  npa_asr --install                установить в профиль и включить автозапуск\n"
+        "  npa_asr --install-only           установить в профиль без автозапуска\n"
+        "  npa_asr --uninstall              удалить автозапуск и установленные файлы\n"
+        "  npa_asr --uninstall-keep-files   удалить автозапуск, установленные файлы оставить\n"
+        "  npa_asr --autostart on|off       включить или выключить автозапуск\n"
+        "  npa_asr --install-status         показать состояние установки и автозапуска\n"
         "\n"
         "options:\n"
         "  -m, --model PATH     path to the .gguf model\n"
@@ -50,7 +57,13 @@ void usage() {
         "      --record SEC     record SEC seconds from the microphone\n"
         "      --save-wav PATH  write the recorded audio to a wav file\n"
         "      --fft NAME       mel FFT back-end: auto | internal | mkl\n"
-        "      --dump-tokens    print token ids\n",
+        "      --dump-tokens    print token ids\n"
+        "      --install        установить копию приложения и включить автозапуск\n"
+        "      --install-only   установить копию приложения без автозапуска\n"
+        "      --uninstall      удалить автозапуск и установленные файлы\n"
+        "      --uninstall-keep-files  удалить автозапуск, файлы оставить\n"
+        "      --autostart on|off      включить или выключить автозапуск\n"
+        "      --install-status показать состояние установки и автозапуска\n",
         ASR_VERSION);
 }
 
@@ -60,6 +73,9 @@ struct Args {
     float step = 1.0f, window = 20.0f;
     bool stream = false, mic = false, dump_tokens = false;
     bool list_devices = false, list_models = false, manifest = false, info = false;
+    bool install = false, install_only = false;
+    bool uninstall = false, uninstall_keep_files = false, install_status = false;
+    int autostart = -1;  // -1 = not requested, 0 = off, 1 = on
     bool help = false;
     float record_sec = 0.0f;
     std::string fft = "auto";
@@ -88,6 +104,18 @@ bool parse_args(const std::vector<std::string> & args, Args * a) {
         else if (s == "--list-models") a->list_models = true;
         else if (s == "--manifest") a->manifest = true;
         else if (s == "--info") a->info = true;
+        else if (s == "--install") a->install = true;
+        else if (s == "--install-only") a->install_only = true;
+        else if (s == "--uninstall") a->uninstall = true;
+        else if (s == "--uninstall-keep-files") a->uninstall_keep_files = true;
+        else if (s == "--install-status") a->install_status = true;
+        else if (s == "--autostart") {
+            std::string v;
+            if (!next(&v)) return false;
+            if (v == "on") a->autostart = 1;
+            else if (v == "off") a->autostart = 0;
+            else { std::fprintf(stderr, "--autostart: ожидается on или off\n"); return false; }
+        }
         else if (s == "--record") { std::string v; if (!next(&v)) return false; a->record_sec = std::stof(v); }
         else if (s == "--save-wav") { if (!next(&a->save_wav)) return false; }
         else if (s == "--fft") { if (!next(&a->fft)) return false; }
@@ -290,6 +318,61 @@ int cmd_mic(const Args & a) {
     return 0;
 }
 
+int cmd_install(const Args & a) {
+    const bool want_autostart = a.install && !a.install_only;
+    std::string err;
+    if (!install_app(want_autostart, false, &err)) {
+        std::fprintf(stderr, "установка не удалась: %s\n", err.c_str());
+        return 1;
+    }
+    const InstallStatus st = install_status();
+    std::printf("установлено: %s\n", st.install_exe.c_str());
+    if (want_autostart) {
+        std::printf("автозапуск включён: %s\n", st.autostart_target.c_str());
+    } else {
+        std::printf("автозапуск не включён (включить: npa_asr --autostart on)\n");
+    }
+    return 0;
+}
+
+int cmd_uninstall(const Args & a) {
+    std::string err;
+    if (!uninstall_app(a.uninstall_keep_files, &err)) {
+        std::fprintf(stderr, "удаление не удалось: %s\n", err.c_str());
+        return 1;
+    }
+    if (a.uninstall_keep_files) {
+        std::printf("автозапуск удалён, установленные файлы сохранены\n");
+    } else {
+        std::printf("автозапуск и установленные файлы удалены\n");
+    }
+    return 0;
+}
+
+int cmd_set_autostart(bool on) {
+    std::string err;
+    if (!set_autostart(on, &err)) {
+        std::fprintf(stderr, "не удалось изменить автозапуск: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf(on ? "автозапуск включён\n" : "автозапуск выключен\n");
+    return 0;
+}
+
+int cmd_install_status() {
+    const InstallStatus st = install_status();
+    std::printf("исполняемый файл      : %s\n", st.exe_path.c_str());
+    std::printf("каталог установки     : %s\n", st.install_dir.c_str());
+    std::printf("установлено           : %s\n", st.installed ? "да" : "нет");
+    std::printf("копия актуальна       : %s\n",
+                !st.installed ? "-" : (st.up_to_date ? "да" : "нет"));
+    std::printf("автозапуск            : %s\n", st.autostart ? "включён" : "выключен");
+    std::printf("запущено из установки : %s\n", st.running_installed ? "да" : "нет");
+    std::printf("точка автозапуска     : %s\n", st.autostart_target.c_str());
+    if (!st.detail.empty()) std::printf("примечание            : %s\n", st.detail.c_str());
+    return 0;
+}
+
 }  // namespace
 
 // Records a fixed number of seconds from the microphone and transcribes it.
@@ -368,6 +451,10 @@ int run_cli(const std::vector<std::string> & args) {
         return 0;
     }
     if (!a.fft.empty()) set_fft_backend(a.fft);
+    if (a.install_status) return cmd_install_status();
+    if (a.install || a.install_only) return cmd_install(a);
+    if (a.uninstall || a.uninstall_keep_files) return cmd_uninstall(a);
+    if (a.autostart >= 0) return cmd_set_autostart(a.autostart == 1);
     if (a.info) return cmd_info();
     if (a.list_devices) return cmd_list_devices();
     if (a.list_models) {
