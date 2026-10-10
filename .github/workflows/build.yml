@@ -1,65 +1,134 @@
 name: Build
 
+# Builds the single-file desktop application (GUI + CLI) on Linux and Windows.
+#
+# The build is fully static: ggml is compiled in, no runtime-dispatched backend
+# libraries are produced, and the only dynamic dependencies left on Linux are
+# system libraries (libX11, libGL, libcurl).
+#
+# ASR_CPU_ARCH keeps its default value x86-64-v3, which is portable down to
+# Haswell (2013).  Never pass -DASR_NATIVE=ON for artifacts that are handed to
+# users: it would bake in the ISA extensions of the GitHub runner CPU.
+
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned third-party versions from cmake/deps.cmake.  Together with the runner
+  # OS and the hash of deps.cmake this builds the dependency cache key.
+  ASR_DEPS_KEY: ggml-ffa4e8b80930029a35991f94e7c8a93cd67730ab-imgui-v1.92.9b-glfw-3.4-miniaudio-0.11.25-json-v3.11.3
+
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            artifact: npa_asr-linux-x86_64
+            binary: build/bin/npa_asr
+          - name: Windows x86_64
+            os: windows-latest
+            artifact: npa_asr-windows-x86_64
+            binary: build/bin/npa_asr.exe
+
     steps:
       - uses: actions/checkout@v4
 
+      # third_party/ is gitignored and populated at configure time by
+      # cmake/deps.cmake (sources in third_party/<name>, FetchContent scratch
+      # space in third_party/_fetched), so it can safely be cached wholesale.
+      - name: Cache fetched third-party sources
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: ${{ runner.os }}-third-party-${{ env.ASR_DEPS_KEY }}-${{ hashFiles('cmake/deps.cmake') }}
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
+          sudo apt-get install -y \
+            ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
 
-      - name: Configure and build (runtime CPU dispatch, fallback included)
-        run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j "$(nproc)"
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
+      - name: Build
+        if: runner.os == 'Linux'
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      # CLI-only smoke tests: they run headless, the GUI is never started.
       - name: Smoke test
+        if: runner.os == 'Linux'
         run: |
           ./build/bin/npa_asr --help
           ./build/bin/npa_asr --info
           ./build/bin/npa_asr --list-models || true
 
-      - name: Upload the Linux bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: npa_asr-linux-x86_64
-          path: |
-            build/bin/npa_asr
-            build/bin/*.so*
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure and build (MSVC + Ninja)
-        shell: cmd
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" 2>nul || call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" 2>nul || call "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j
-
       - name: Smoke test
-        shell: cmd
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           build\bin\npa_asr.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           build\bin\npa_asr.exe --info
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # exits non-zero when the runner has no local models: not a failure
+          build\bin\npa_asr.exe --list-models
+          exit 0
 
-      - name: Upload the Windows bundle
+      - name: Add "npa_asr --info" to the job summary
+        if: runner.os == 'Linux'
+        run: |
+          {
+            echo '### npa_asr --info'
+            echo '```'
+            ./build/bin/npa_asr --info 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add "npa_asr --info" to the job summary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # stdout only: no 2>&1, so stderr cannot turn into a terminating
+          # error under the runner's $ErrorActionPreference = 'stop'
+          $info = & build\bin\npa_asr.exe --info | Out-String
+          Write-Output $info
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '### npa_asr --info'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $info
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+          exit 0
+
+      # The build output is one self-contained executable, nothing else.
+      - name: Upload the executable
         uses: actions/upload-artifact@v4
         with:
-          name: npa_asr-windows-x86_64
-          path: |
-            build/bin/npa_asr.exe
-            build/bin/*.dll
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          retention-days: 14
+          if-no-files-found: error
