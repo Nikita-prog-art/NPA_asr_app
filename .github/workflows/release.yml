@@ -1,0 +1,173 @@
+name: Release
+
+# Builds the static single-file desktop application for both platforms and
+# publishes it as a GitHub release.
+#
+# Triggered by a "v*" tag push, or manually with an explicit tag.  Release
+# artifacts are always built with the default ASR_CPU_ARCH=x86-64-v3 (portable
+# down to Haswell 2013) and with ASR_TOOLS=OFF, so the asr_test numerical
+# self-test (which needs golden files that CI does not have) is not shipped.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  ASR_DEPS_KEY: ggml-ffa4e8b80930029a35991f94e7c8a93cd67730ab-imgui-v1.92.9b-glfw-3.4-miniaudio-0.11.25-json-v3.11.3
+  # Tag push -> github.ref_name, manual run -> the "tag" input.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            artifact: release-linux-x86_64
+            suffix: linux-x86_64
+          - name: Windows x86_64
+            os: windows-latest
+            artifact: release-windows-x86_64
+            suffix: windows-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache fetched third-party sources
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: ${{ runner.os }}-third-party-${{ env.ASR_DEPS_KEY }}-${{ hashFiles('cmake/deps.cmake') }}
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DASR_TOOLS=OFF
+
+      - name: Build
+        if: runner.os == 'Linux'
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      # CLI-only smoke tests: they run headless, the GUI is never started.
+      - name: Smoke test
+        if: runner.os == 'Linux'
+        run: |
+          ./build/bin/npa_asr --help
+          ./build/bin/npa_asr --info
+          ./build/bin/npa_asr --list-models || true
+
+      - name: Smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          build\bin\npa_asr.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          build\bin\npa_asr.exe --info
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # exits non-zero when the runner has no local models: not a failure
+          build\bin\npa_asr.exe --list-models
+          exit 0
+
+      - name: Add "npa_asr --info" to the job summary
+        if: runner.os == 'Linux'
+        run: |
+          {
+            echo '### npa_asr --info'
+            echo '```'
+            ./build/bin/npa_asr --info 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Add "npa_asr --info" to the job summary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # stdout only: no 2>&1, so stderr cannot turn into a terminating
+          # error under the runner's $ErrorActionPreference = 'stop'
+          $info = & build\bin\npa_asr.exe --info | Out-String
+          Write-Output $info
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '### npa_asr --info'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $info
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '```'
+          exit 0
+
+      - name: Stage the release asset
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          mkdir -p dist
+          cp build/bin/npa_asr "dist/npa_asr-${version}-${{ matrix.suffix }}"
+          ls -l dist
+
+      - name: Stage the release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build\bin\npa_asr.exe "dist\npa_asr-$version-${{ matrix.suffix }}.exe"
+          Get-ChildItem dist
+
+      - name: Upload the release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish the GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List the release assets
+        run: ls -l dist
+
+      - name: Create or update the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
