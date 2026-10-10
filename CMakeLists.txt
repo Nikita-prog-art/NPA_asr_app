@@ -13,52 +13,121 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Everything we build ourselves (ggml, imgui, glfw, the application) is linked
+# statically, so the result is one self-contained executable and "installing"
+# the application means copying a single file.  On Windows this also selects the
+# static C runtime (/MT), so the target machine needs no Visual C++
+# redistributable; on Linux the C++ runtime is linked in as well, which leaves
+# only the system libraries (libX11, libGL, libcurl) dynamic.
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---------------------------------------------------------------- options
 option(ASR_GUI     "build the ImGui desktop GUI"                ON)
 option(ASR_TOOLS   "build test/benchmark tools"                 ON)
-option(ASR_NATIVE  "single-arch binary tuned for the build machine, no runtime CPU dispatch" OFF)
-# oneMKL DFTI for the 320-point mel FFT.  OFF by default on purpose: linking
-# oneMKL makes the executable depend on the oneAPI runtime (on Windows
-# mkl_rt.2.dll must be on PATH, i.e. you have to run setvars.bat before the app),
-# while the built-in Bluestein FFT is portable and costs ~20 MFLOP/s of audio.
-# scripts/build_linux.sh turns it ON because there the linker records an rpath.
-option(ASR_MKL_FFT "use Intel oneMKL for the mel-spectrogram FFT when available" OFF)
 option(ASR_FETCH_DEPS "download missing third-party sources at configure time" ON)
+# ggml's own thread pool is used by default; OpenMP adds a runtime dependency
+# (libgomp.so / vcomp140.dll) and measured no faster, so it stays off.
+option(ASR_OPENMP  "let ggml use OpenMP (adds a libgomp/vcomp runtime dependency)" OFF)
+set(ASR_CPU_ARCH "x86-64-v3" CACHE STRING
+    "x86-64 baseline the binary is compiled for: native | x86-64-v3 | x86-64-v2 | x86-64")
+# Kept as a shorthand for -DASR_CPU_ARCH=native.
+option(ASR_NATIVE  "build for the machine that compiles the project" OFF)
 
 if(NOT MSVC)
   add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+  add_link_options(-static-libgcc -static-libstdc++)
 endif()
 
-include(cmake/oneapi.cmake)
+# ---------------------------------------------------------------- CPU baseline
+# A statically linked binary cannot pick a CPU backend at run time, so the
+# instruction set is fixed when the project is configured.  The default,
+# x86-64-v3 (AVX2 + FMA + F16C + BMI2), runs on every Intel CPU since Haswell
+# (2013) and every AMD Zen; "native" is fastest but only runs on the machine
+# that compiled it, and "x86-64-v2"/"x86-64" go further back.
+if(ASR_NATIVE)
+  set(ASR_CPU_ARCH "native" CACHE STRING "" FORCE)
+endif()
+
+set(ASR_ARCH_FLAG "")
+if(MSVC)
+  if(ASR_CPU_ARCH STREQUAL "native" OR ASR_CPU_ARCH STREQUAL "x86-64-v3")
+    set(ASR_ARCH_FLAG "/arch:AVX2")
+  endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  if(ASR_CPU_ARCH STREQUAL "native")
+    set(ASR_ARCH_FLAG "-march=native")
+  elseif(ASR_CPU_ARCH MATCHES "^x86-64")
+    set(ASR_ARCH_FLAG "-march=${ASR_CPU_ARCH}")
+  else()
+    message(FATAL_ERROR "ASR_CPU_ARCH must be native, x86-64-v3, x86-64-v2 or x86-64")
+  endif()
+endif()
+if(ASR_ARCH_FLAG)
+  add_compile_options(${ASR_ARCH_FLAG})
+endif()
+message(STATUS "CPU baseline: ${ASR_CPU_ARCH} ${ASR_ARCH_FLAG}")
+
+# ggml enables AVX2 unconditionally on x86 when it is not told otherwise, so its
+# instruction set switches are kept in sync with ASR_CPU_ARCH.
+if(ASR_CPU_ARCH STREQUAL "native")
+  set(ASR_GGML_NATIVE ON)
+  set(ASR_ISA_SSE42 ON)
+  set(ASR_ISA_AVX   ON)
+  set(ASR_ISA_AVX2  ON)
+  set(ASR_ISA_FMA   ON)
+  set(ASR_ISA_F16C  ON)
+  set(ASR_ISA_BMI2  ON)
+else()
+  set(ASR_GGML_NATIVE OFF)
+  set(ASR_ISA_SSE42 OFF)
+  set(ASR_ISA_AVX   OFF)
+  set(ASR_ISA_AVX2  OFF)
+  set(ASR_ISA_FMA   OFF)
+  set(ASR_ISA_F16C  OFF)
+  set(ASR_ISA_BMI2  OFF)
+  if(ASR_CPU_ARCH STREQUAL "x86-64-v3")
+    set(ASR_ISA_SSE42 ON)
+    set(ASR_ISA_AVX   ON)
+    set(ASR_ISA_AVX2  ON)
+    set(ASR_ISA_FMA   ON)
+    set(ASR_ISA_F16C  ON)
+    set(ASR_ISA_BMI2  ON)
+  elseif(ASR_CPU_ARCH STREQUAL "x86-64-v2")
+    set(ASR_ISA_SSE42 ON)
+    set(ASR_ISA_AVX   ON)
+  elseif(NOT ASR_CPU_ARCH STREQUAL "x86-64")
+    message(FATAL_ERROR "ASR_CPU_ARCH must be native, x86-64-v3, x86-64-v2 or x86-64")
+  endif()
+endif()
+
 include(cmake/deps.cmake)
 
 # ---------------------------------------------------------------- ggml
-# Two modes:
-#  * default   : one binary carrying every x86 CPU backend variant and picking
-#                the best at runtime (alderlake/AVX-VNNI on Raptor Lake, falling
-#                back to haswell/AVX2, sandybridge/AVX, sse42, x64);
-#  * ASR_NATIVE: tuned for the build machine only (fastest, no fallback).
 set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(GGML_OPENMP         ON  CACHE BOOL "" FORCE)
 set(GGML_CCACHE         OFF CACHE BOOL "" FORCE)
 set(GGML_LTO            OFF CACHE BOOL "" FORCE)
 set(GGML_ALL_WARNINGS   OFF CACHE BOOL "" FORCE)
 set(GGML_ALL_WARNINGS_3RD_PARTY OFF CACHE BOOL "" FORCE)
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-
-if(ASR_NATIVE)
-  set(GGML_NATIVE           ON  CACHE BOOL "" FORCE)
-  set(BUILD_SHARED_LIBS     OFF CACHE BOOL "" FORCE)
-  set(GGML_BACKEND_DL       OFF CACHE BOOL "" FORCE)
-  set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
-  message(STATUS "ggml: native build (no runtime CPU dispatch)")
-else()
-  set(GGML_NATIVE           OFF CACHE BOOL "" FORCE)
-  set(GGML_BACKEND_DL       ON  CACHE BOOL "" FORCE)
-  set(GGML_CPU_ALL_VARIANTS ON  CACHE BOOL "" FORCE)
-  set(BUILD_SHARED_LIBS     ON  CACHE BOOL "" FORCE)
-endif()
+set(GGML_OPENMP         ${ASR_OPENMP} CACHE BOOL "" FORCE)
+# Static single-ISA CPU backend: no runtime-dispatched modules next to the
+# executable, no BUILD_SHARED_LIBS, no dlopen of ggml-cpu-*.so/.dll.
+set(GGML_BACKEND_DL       OFF CACHE BOOL "" FORCE)
+set(GGML_CPU_ALL_VARIANTS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS     OFF CACHE BOOL "" FORCE)
+set(GGML_STATIC           OFF CACHE BOOL "" FORCE)  # would add a global -static
+set(GGML_NATIVE           ${ASR_GGML_NATIVE} CACHE BOOL "" FORCE)
+set(GGML_SSE42            ${ASR_ISA_SSE42} CACHE BOOL "" FORCE)
+set(GGML_AVX              ${ASR_ISA_AVX}   CACHE BOOL "" FORCE)
+set(GGML_AVX2             ${ASR_ISA_AVX2}  CACHE BOOL "" FORCE)
+set(GGML_FMA              ${ASR_ISA_FMA}   CACHE BOOL "" FORCE)
+set(GGML_F16C             ${ASR_ISA_F16C}  CACHE BOOL "" FORCE)
+set(GGML_BMI2             ${ASR_ISA_BMI2}  CACHE BOOL "" FORCE)
+set(GGML_AVX_VNNI         OFF CACHE BOOL "" FORCE)
+set(GGML_AVX512           OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
 
@@ -78,12 +147,8 @@ target_include_directories(asr_core PUBLIC
 target_link_libraries(asr_core PUBLIC ggml)
 target_compile_definitions(asr_core PUBLIC
   ASR_VERSION="${ASR_VERSION}"
+  ASR_CPU_BASELINE="${ASR_CPU_ARCH}"
   ASR_HAVE_GUI=$<BOOL:${ASR_GUI}>)
-if(asr_have_mkl_fft)
-  target_compile_definitions(asr_core PUBLIC ASR_HAVE_MKL_FFT=1)
-  target_include_directories(asr_core PUBLIC ${MKL_INCLUDE_DIR})
-  target_link_libraries(asr_core PUBLIC ${MKL_RT})
-endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(asr_core PUBLIC Threads::Threads)
@@ -150,28 +215,10 @@ if(WIN32)
   target_link_libraries(npa_asr PRIVATE winhttp shlwapi ws2_32)
 endif()
 
-# keep every runtime artifact (ggml backend DLLs/SOs) next to the executable
 set_target_properties(npa_asr PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/bin
   RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/bin)
-foreach(tgt ggml-base ggml-cpu x64 sse42 sandybridge ivybridge piledriver haswell
-            skylakex cannonlake cascadelake icelake cooperlake zen4 alderlake sapphirerapids)
-  if(TARGET ggml-cpu-${tgt})
-    set_target_properties(ggml-cpu-${tgt} PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-  elseif(TARGET ${tgt})
-    set_target_properties(${tgt} PROPERTIES
-      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-  endif()
-endforeach()
-if(TARGET ggml-base)
-  set_target_properties(ggml-base PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-endif()
 
 if(ASR_TOOLS)
   add_subdirectory(tools)

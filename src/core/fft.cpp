@@ -1,5 +1,6 @@
 #include "core/fft.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -8,14 +9,13 @@
 #define M_PI 3.14159265358979323846  // MSVC does not define it without _USE_MATH_DEFINES
 #endif
 
-#if defined(ASR_HAVE_MKL_FFT)
-#include <mkl_dfti.h>
-#endif
-
 namespace asr {
 
 namespace {
-enum FftBackend { kFftAuto = 0, kFftInternal = 1, kFftMkl = 2 };
+// The application ships a single self-contained implementation.  The name is
+// still parsed (and "mkl" is still accepted) so that old command lines and
+// settings keep working, but everything now runs on the built-in Bluestein FFT.
+enum FftBackend { kFftAuto = 0, kFftInternal = 1, kFftMklRemoved = 2 };
 int g_fft_backend = kFftAuto;
 }  // namespace
 
@@ -23,19 +23,14 @@ void set_fft_backend(const std::string & name) {
     if (name == "internal" || name == "builtin" || name == "bluestein") {
         g_fft_backend = kFftInternal;
     } else if (name == "mkl" || name == "onemkl") {
-        g_fft_backend = kFftMkl;
+        g_fft_backend = kFftMklRemoved;
     } else {
         g_fft_backend = kFftAuto;
     }
 }
 
 std::string fft_backend_name() {
-#if defined(ASR_HAVE_MKL_FFT)
-    if (g_fft_backend == kFftMkl) return "oneMKL (forced)";
-    if (g_fft_backend == kFftAuto) return "oneMKL";
-#else
-    if (g_fft_backend == kFftMkl) return "internal Bluestein (oneMKL not compiled in)";
-#endif
+    if (g_fft_backend == kFftMklRemoved) return "internal Bluestein (oneMKL support was removed)";
     return "internal Bluestein";
 }
 
@@ -77,39 +72,11 @@ int next_pow2(int n) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- MKL
-
-#if defined(ASR_HAVE_MKL_FFT)
-struct Rfft::Mkl {
-    DFTI_DESCRIPTOR_HANDLE handle = nullptr;
-    bool batch_ready = false;
-    int batch_n = 0;
-    ~Mkl() {
-        if (handle) DftiFreeDescriptor(&handle);
-    }
-};
-#endif
-
 Rfft::Rfft(int n) : n_(n) {
     if (n < 2) throw std::invalid_argument("Rfft: n must be >= 2");
 
-#if defined(ASR_HAVE_MKL_FFT)
-    if (g_fft_backend != kFftInternal) {
-        mkl_ = std::make_unique<Mkl>();
-        const MKL_LONG dims[1] = {n};
-        if (DftiCreateDescriptor(&mkl_->handle, DFTI_SINGLE, DFTI_REAL, 1, dims) != DFTI_NO_ERROR) {
-            mkl_.reset();
-        } else {
-            DftiSetValue(mkl_->handle, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
-            DftiSetValue(mkl_->handle, DFTI_CONJUGATE_EVEN_STORAGE, DFTI_COMPLEX_COMPLEX);
-            DftiSetValue(mkl_->handle, DFTI_PACKED_FORMAT, DFTI_CCS_FORMAT);
-            if (DftiCommitDescriptor(mkl_->handle) != DFTI_NO_ERROR) mkl_.reset();
-        }
-    }
-#endif
-
-    // Bluestein tables - also prepared when MKL is available so that the
-    // portable path can be selected for verification.
+    // Bluestein tables.  n_fft = 320 = 2^6 * 5 is not a power of two, so the
+    // chirp-z transform is the cheapest way to a plain radix-2 kernel.
     m_ = next_pow2(2 * n - 1);
     chirp_.resize(n);
     std::vector<std::complex<double>> b(m_, {0.0, 0.0});
@@ -122,26 +89,20 @@ Rfft::Rfft(int n) : n_(n) {
     }
     fft_radix2(b.data(), m_, false);
     kernel_ = std::move(b);
-    work_.resize(m_);
 }
 
 Rfft::~Rfft() = default;
 
-bool Rfft::using_mkl() const {
-#if defined(ASR_HAVE_MKL_FFT)
-    return g_fft_backend != kFftInternal && mkl_ && mkl_->handle != nullptr;
-#else
-    return false;
-#endif
-}
+bool Rfft::using_mkl() const { return false; }
 
-void Rfft::forward_internal(const float * in, std::complex<float> * out) const {
-    std::vector<std::complex<double>> & a = const_cast<Rfft *>(this)->work_;
-    std::fill(a.begin(), a.end(), std::complex<double>(0.0, 0.0));
+void Rfft::forward_internal(const float * in, std::complex<float> * out,
+                            std::complex<double> * scratch) const {
+    std::complex<double> * a = scratch;
+    std::fill(a, a + m_, std::complex<double>(0.0, 0.0));
     for (int k = 0; k < n_; ++k) a[k] = static_cast<double>(in[k]) * chirp_[k];
-    fft_radix2(a.data(), m_, false);
+    fft_radix2(a, m_, false);
     for (int k = 0; k < m_; ++k) a[k] *= kernel_[k];
-    fft_radix2(a.data(), m_, true);
+    fft_radix2(a, m_, true);
     for (int k = 0; k <= n_ / 2; ++k) {
         const std::complex<double> v = a[k] * chirp_[k];
         out[k] = std::complex<float>(static_cast<float>(v.real()), static_cast<float>(v.imag()));
@@ -149,48 +110,22 @@ void Rfft::forward_internal(const float * in, std::complex<float> * out) const {
 }
 
 void Rfft::forward_batch_internal(const float * in, std::complex<float> * out, int n_frames) const {
+    // One scratch buffer for the whole batch: no member state is touched, so
+    // several threads may share one Rfft instance.
+    std::vector<std::complex<double>> scratch(static_cast<size_t>(m_));
     for (int f = 0; f < n_frames; ++f) {
-        forward_internal(in + static_cast<size_t>(f) * n_, out + static_cast<size_t>(f) * n_bins());
+        forward_internal(in + static_cast<size_t>(f) * n_, out + static_cast<size_t>(f) * n_bins(),
+                         scratch.data());
     }
 }
 
 void Rfft::forward(const float * in, std::complex<float> * out) const {
-#if defined(ASR_HAVE_MKL_FFT)
-    if (using_mkl()) {
-        const MKL_LONG status = DftiComputeForward(mkl_->handle, const_cast<float *>(in),
-                                                  reinterpret_cast<float *>(out));
-        if (status == DFTI_NO_ERROR) return;
-    }
-#endif
-    forward_internal(in, out);
+    std::vector<std::complex<double>> scratch(static_cast<size_t>(m_));
+    forward_internal(in, out, scratch.data());
 }
 
 void Rfft::forward_batch(const float * in, std::complex<float> * out, int n_frames) const {
     if (n_frames <= 0) return;
-#if defined(ASR_HAVE_MKL_FFT)
-    if (using_mkl() && n_frames > 1) {
-        if (!mkl_->batch_ready || mkl_->batch_n != n_frames) {
-            MKL_LONG strides_in[2] = {0, static_cast<MKL_LONG>(n_)};
-            MKL_LONG strides_out[2] = {0, static_cast<MKL_LONG>(n_bins()) * 2};
-            DftiSetValue(mkl_->handle, DFTI_NUMBER_OF_TRANSFORMS, n_frames);
-            DftiSetValue(mkl_->handle, DFTI_INPUT_DISTANCE, n_);
-            DftiSetValue(mkl_->handle, DFTI_OUTPUT_DISTANCE, n_bins() * 2);
-            DftiSetValue(mkl_->handle, DFTI_INPUT_STRIDES, strides_in);
-            DftiSetValue(mkl_->handle, DFTI_OUTPUT_STRIDES, strides_out);
-            if (DftiCommitDescriptor(mkl_->handle) != DFTI_NO_ERROR) {
-                forward_batch_internal(in, out, n_frames);
-                return;
-            }
-            mkl_->batch_ready = true;
-            mkl_->batch_n = n_frames;
-        }
-        if (DftiComputeForward(mkl_->handle, const_cast<float *>(in),
-                               reinterpret_cast<float *>(out)) == DFTI_NO_ERROR) {
-            return;
-        }
-        mkl_->batch_ready = false;
-    }
-#endif
     forward_batch_internal(in, out, n_frames);
 }
 

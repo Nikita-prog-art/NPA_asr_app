@@ -41,7 +41,13 @@ Settings Settings::load() {
         s.output_mode = output_mode_from_name(j.value("output_mode", std::string("insert+clipboard")));
         s.step_sec = j.value("step_sec", s.step_sec);
         s.max_window_sec = j.value("max_window_sec", s.max_window_sec);
-        s.always_on_top = j.value("always_on_top", s.always_on_top);
+        s.ui_scale = j.value("ui_scale", s.ui_scale);
+        // v1 kept the window above every other window by default, which made it
+        // impossible to get out of the way; files written before v2 keep the new
+        // default instead of the value they were saved with.
+        const int version = j.value("version", 1);
+        s.always_on_top = version >= 2 ? j.value("always_on_top", s.always_on_top)
+                                       : s.always_on_top;
         s.sound_on_done = j.value("sound_on_done", s.sound_on_done);
     } catch (const std::exception &) {
         // corrupted settings: keep the defaults
@@ -52,6 +58,7 @@ Settings Settings::load() {
 bool Settings::save(std::string * err) const {
     try {
         nlohmann::json j;
+        j["version"] = 2;
         j["model_path"] = model_path;
         j["n_threads"] = n_threads;
         j["hotkey"] = hotkey;

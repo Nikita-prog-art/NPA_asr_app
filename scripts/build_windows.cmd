@@ -4,17 +4,15 @@ rem
 rem   scripts\build_windows.cmd [extra cmake args...]
 rem
 rem Environment:
-rem   ONEAPI_ROOT   oneAPI installation (default: C:\Program Files (x86)\Intel\oneAPI)
-rem   ASR_COMPILER  cl | icx   (default: cl, the best tested path for ggml on MSVC)
-rem   ASR_MKL_FFT   ON to link oneMKL for the mel FFT (default: OFF, see README)
-rem   ASR_NATIVE    ON to build a single-arch binary for this machine only
+rem   ASR_CPU_ARCH  x86-64-v3 (default) | native | x86-64-v2 | x86-64
+rem                 native = tuned for this machine only, no fallback
+rem   ASR_NATIVE    ON is a shorthand for ASR_CPU_ARCH=native
+rem   ASR_JOBS      parallel build jobs (default: derived from the RAM size)
 rem   BUILD_DIR     build directory (default: <repo>\build-windows)
 setlocal enabledelayedexpansion
 
 set "ROOT=%~dp0.."
 if "%BUILD_DIR%"=="" set "BUILD_DIR=%ROOT%\build-windows"
-if "%ONEAPI_ROOT%"=="" set "ONEAPI_ROOT=C:\Program Files (x86)\Intel\oneAPI"
-if "%ASR_COMPILER%"=="" set "ASR_COMPILER=cl"
 
 rem ---- Visual Studio environment (MSVC + ninja + cmake come with VS) --------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -28,45 +26,13 @@ if defined VSPATH (
     echo [build] vswhere/VS not found - assuming cl.exe is already on PATH
 )
 
-rem ---- oneAPI (optional: only for the Intel compiler or oneMKL) ------------
-rem oneMKL is opt-in because it makes the exe depend on mkl_rt.2.dll at runtime
-rem (you would have to run setvars.bat before starting the app), and it is worth
-rem about 0.2% of the total runtime - see README.
-if /I "%ASR_COMPILER%"=="icx" goto :oneapi
-if /I "%ASR_MKL_FFT%"=="ON" goto :oneapi
-goto :after_oneapi
-:oneapi
-if exist "%ONEAPI_ROOT%\setvars.bat" (
-    echo [build] oneAPI: %ONEAPI_ROOT%
-    call "%ONEAPI_ROOT%\setvars.bat" intel64 >nul 2>&1
-) else (
-    echo [build] oneAPI not found at %ONEAPI_ROOT%
-)
-:after_oneapi
+set "ARCH_ARG="
+if not "%ASR_CPU_ARCH%"=="" set "ARCH_ARG=-DASR_CPU_ARCH=%ASR_CPU_ARCH%"
+if /I not "%ASR_NATIVE%"=="OFF" set "ARCH_ARG=-DASR_NATIVE=ON"
 
-set "CC_BIN=cl"
-set "CXX_BIN=cl"
-if /I "%ASR_COMPILER%"=="icx" (
-    set "CC_BIN=icx"
-    set "CXX_BIN=icx"
-    where icx >nul 2>&1 || (
-        echo [build] icx not found, falling back to cl
-        set "CC_BIN=cl"
-        set "CXX_BIN=cl"
-    )
-)
-
-rem oneMKL needs mkl_rt.2.dll on PATH at runtime, so it is opt-in on Windows:
-rem   set ASR_MKL_FFT=ON   (then run setvars.bat before npa_asr.exe)
-set "MKL_ARG=-DASR_MKL_FFT=OFF"
-if /I "%ASR_MKL_FFT%"=="ON" set "MKL_ARG=-DASR_MKL_FFT=ON"
-
-set "NATIVE_ARG="
-if /I not "%ASR_NATIVE%"=="OFF" set "NATIVE_ARG=-DASR_NATIVE=ON"
-
-rem ggml compiles its CPU backend once per ISA variant and the big translation
-rem units (ggml-cpu/ops.cpp with AVX512) need ~2 GB of RAM each: budget ~2 GB
-rem per job so a memory-limited VM/WSL does not get swapped to death.
+rem One ggml CPU backend is compiled for a fixed ISA baseline, so a job needs
+rem roughly 1 GB; budget 2 GB per job anyway so a memory-limited machine does
+rem not get swapped to death.  ASR_JOBS overrides the heuristic.
 set "JOBS=%ASR_JOBS%"
 if "%JOBS%"=="" (
     for /f %%m in ('powershell -NoProfile -Command "[math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)" 2^>nul') do set "RAM_GB=%%m"
@@ -76,12 +42,12 @@ if "%JOBS%"=="" (
 )
 echo [build] parallel jobs: %JOBS%
 
-echo [build] compiler: %CC_BIN%
+echo [build] compiler: cl
 cmake -S "%ROOT%" -B "%BUILD_DIR%" -G Ninja ^
     -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_C_COMPILER=%CC_BIN% ^
-    -DCMAKE_CXX_COMPILER=%CXX_BIN% ^
-    %NATIVE_ARG% %MKL_ARG% %*
+    -DCMAKE_C_COMPILER=cl ^
+    -DCMAKE_CXX_COMPILER=cl ^
+    %ARCH_ARG% %*
 if errorlevel 1 goto :fail
 
 cmake --build "%BUILD_DIR%" -j %JOBS%
@@ -89,7 +55,7 @@ if errorlevel 1 goto :fail
 
 echo.
 echo [build] done: %BUILD_DIR%\bin\npa_asr.exe
-echo [build] note: keep the ggml-cpu-*.dll files next to the executable
+echo [build] the executable is self-contained: no DLLs are needed next to it
 exit /b 0
 
 :fail

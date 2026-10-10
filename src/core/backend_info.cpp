@@ -1,42 +1,63 @@
 #include "core/backend_info.h"
 
-#include <algorithm>
 #include <cstdio>
-#include <filesystem>
 #include <string>
-#include <vector>
 
 #include "ggml-backend.h"
 #include "platform/platform.h"
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#  include <intrin.h>
+#endif
+
+#ifndef ASR_CPU_BASELINE
+#  define ASR_CPU_BASELINE "x86-64-v3"
+#endif
 
 namespace asr {
 
 namespace {
 
-// The runtime-dispatched CPU backends are separate modules (ggml-cpu-alderlake,
-// ggml-cpu-haswell, ...) sitting next to the executable.  ggml scores them at
-// startup and registers only the best one as "CPU", so listing the modules is
-// what shows the fallback chain that was shipped.
-std::vector<std::string> cpu_variant_modules() {
-    std::vector<std::string> out;
-    std::error_code ec;
-    const std::filesystem::path dir(platform::exe_dir());
-    if (!std::filesystem::is_directory(dir, ec)) return out;
-    for (const auto & e : std::filesystem::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file(ec)) continue;
-        const std::string name = e.path().filename().string();
-        // "ggml-cpu-alderlake.dll" on Windows, "libggml-cpu-alderlake.so" on Linux
-        const size_t pos = name.rfind("ggml-cpu-", 0) == 0 ? 0 : (name.rfind("libggml-cpu-", 0) == 0 ? 3 : std::string::npos);
-        if (pos == std::string::npos) continue;
-        const std::string ext = e.path().extension().string();
-        if (ext != ".so" && ext != ".dll" && ext != ".dylib") continue;
-        out.push_back(e.path().stem().string().substr(pos));
-    }
-    std::sort(out.begin(), out.end());
+#if defined(__x86_64__) || defined(_M_X64)
+bool x86_cpu_has_avx2() {
+#  if defined(_MSC_VER)
+    int regs[4] = {0, 0, 0, 0};
+    __cpuid(regs, 0);
+    if (regs[0] < 7) return false;
+    __cpuidex(regs, 1, 0);
+    const bool osxsave = (regs[2] & (1 << 27)) != 0;
+    const bool avx     = (regs[2] & (1 << 28)) != 0;
+    if (!osxsave || !avx) return false;
+    if ((_xgetbv(0) & 0x6) != 0x6) return false;  // XMM and YMM state enabled
+    __cpuidex(regs, 7, 0);
+    return (regs[1] & (1 << 5)) != 0;
+#  else
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") != 0;
+#  endif
+}
+#else
+bool x86_cpu_has_avx2() { return true; }  // non-x86 builds need no check
+#endif
+
+}  // namespace
+
+std::string cpu_baseline() {
+    std::string out = ASR_CPU_BASELINE;
+    const std::string base = ASR_CPU_BASELINE;
+    if (base == "x86-64-v3") out += " (AVX2/FMA/F16C/BMI2)";
+    else if (base == "x86-64-v2") out += " (SSE4.2/AVX)";
+    else if (base == "x86-64") out += " (baseline x86-64)";
+    else if (base == "native") out += " (tuned for the build machine)";
     return out;
 }
 
-}  // namespace
+bool cpu_supports_baseline() {
+    const std::string base = ASR_CPU_BASELINE;
+    if (base == "native") return true;  // only meant to run where it was built
+    if (base == "x86-64-v3") return x86_cpu_has_avx2();
+    return true;
+}
 
 std::string backend_summary() {
     ggml_backend_load_all();
@@ -63,14 +84,8 @@ std::string backend_summary() {
     }
     if (out.empty()) out = "no ggml backends";
 
-    const std::vector<std::string> variants = cpu_variant_modules();
-    if (!variants.empty()) {
-        out += " | CPU variants: ";
-        for (size_t i = 0; i < variants.size(); ++i) {
-            if (i) out += ", ";
-            out += variants[i];
-        }
-    }
+    out += " | compiled for: ";
+    out += cpu_baseline();
     return out;
 }
 
