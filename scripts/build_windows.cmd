@@ -56,18 +56,33 @@ cmake -S "%ROOT%" -B "%BUILD_DIR%" -G Ninja ^
     %ARCH_ARG% %*
 if errorlevel 1 goto :fail
 
+rem A running application locks its own executable.  Ninja would fail the final
+rem link, and the stale file left behind is easy to mistake for a fresh build,
+so the target is removed up front: that both detects the lock before spending
+time on the build and makes the existence check below mean "this build produced
+it".
+set "EXE=%BUILD_DIR%\bin\npa_asr.exe"
+if exist "%EXE%" (
+    del /f /q "%EXE%" >nul 2>&1
+    if exist "%EXE%" (
+        echo [build] FAILED: %EXE% is locked
+        echo [build]   the application is running - close it and build again
+        exit /b 1
+    )
+)
+
 cmake --build "%BUILD_DIR%" -j %JOBS%
 if errorlevel 1 goto :fail
 
 rem ninja/cmake do not always surface a failed link through errorlevel, so the
 rem result is verified independently before claiming success.
-if not exist "%BUILD_DIR%\bin\npa_asr.exe" (
-    echo [build] FAILED: %BUILD_DIR%\bin\npa_asr.exe was not produced
+if not exist "%EXE%" (
+    echo [build] FAILED: %EXE% was not produced
     exit /b 1
 )
 
 echo.
-echo [build] done: %BUILD_DIR%\bin\npa_asr.exe
+echo [build] done: %EXE%
 echo [build] the executable is self-contained: no DLLs are needed next to it
 exit /b 0
 

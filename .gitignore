@@ -91,3 +91,6 @@ logs/
 
 # parallel work trees used while developing
 .wt/
+
+# sources exported to Windows by scripts/build_windows_from_wsl.sh
+.win_src.tgz

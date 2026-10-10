@@ -28,6 +28,21 @@ tar czf "$TMP_TGZ" -C "$ROOT" \
     --exclude='third_party/_fetched' --exclude='*.gguf' --exclude='.ref' \
     CMakeLists.txt cmake src tools scripts .github README.md third_party
 
+# The tarball carries no .git, so the source revision baked into the binary (the
+# application offers to update an installed copy when it changes) is determined
+# here, where the repository is available.
+BUILD_ID="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+if [ -n "$BUILD_ID" ]; then
+    if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ]; then
+        BUILD_ID="$BUILD_ID-dirty"
+    fi
+    EXTRA_ARGS="-DASR_BUILD_ID=$BUILD_ID"
+    echo "[win] build id: $BUILD_ID"
+else
+    EXTRA_ARGS=""
+    echo "[win] build id: git not available, cmake will fall back to the version"
+fi
+
 # UNC path of the tarball for PowerShell
 UNC_TGZ="\\\\wsl.localhost\\${WSL_DISTRO}\\$(echo "$ROOT" | sed 's|^/||; s|/|\\\\|g')\\.win_src.tgz"
 
@@ -43,7 +58,17 @@ rm -f "$TMP_TGZ"
 
 echo "[win] building on the host"
 cd /mnt/c/Windows/System32
-./cmd.exe /c "${WIN_BUILD_DIR}\\scripts\\build_windows.cmd $*" 2>&1 | tr -d '\r'
+# cmd.exe runs through a pipe, so the status of the build itself has to be read
+# from PIPESTATUS: otherwise a failed build would still report "done".
+set +e
+./cmd.exe /c "${WIN_BUILD_DIR}\\scripts\\build_windows.cmd $EXTRA_ARGS $*" 2>&1 | tr -d '\r'
+RC="${PIPESTATUS[0]}"
+set -e
+if [ "$RC" -ne 0 ]; then
+    echo
+    echo "[win] FAILED: the build on the host returned ${RC}"
+    exit "$RC"
+fi
 
 echo
 echo "[win] done: ${WIN_BUILD_DIR}\\build-windows\\bin\\npa_asr.exe"
