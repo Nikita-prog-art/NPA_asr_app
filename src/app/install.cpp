@@ -5,6 +5,7 @@
 // temporary name in the target directory and then renamed over the destination,
 // so a failure never leaves a half-written executable behind.  Settings and
 // models live in platform::user_data_dir() and are never touched here.
+#include "app/build_info.h"
 #include "app/install.h"
 
 #include <cerrno>
@@ -115,16 +116,52 @@ fs::path path_from_utf8(const std::string & s) {
 #endif
 }
 
-// Lowercase hex digest of a file, "" on failure.  Reading through
-// std::filesystem/std::ifstream takes a native path, so this also works for
-// non-ASCII Windows paths (unlike util::sha256_file, which takes a narrow
+// Whole file as bytes; false when it cannot be read (an empty file reads fine,
+// which matters: an unreadable file must not look like an empty one).  Reading
+// through std::filesystem/std::ifstream takes a native path, so this also works
+// for non-ASCII Windows paths (unlike util::sha256_file, which takes a narrow
 // std::string).
-std::string file_digest(const fs::path & p) {
+bool read_file_bytes(const fs::path & p, std::string * out) {
+    out->clear();
     std::ifstream f(p, std::ios::binary);
-    if (!f) return std::string();
-    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (f.bad()) return std::string();
-    return util::sha256_hex(data);
+    if (!f) return false;
+    out->assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (f.bad()) {
+        out->clear();
+        return false;
+    }
+    return true;
+}
+
+// The source revision of another copy of the application, read out of its image
+// (the "npa-asr-build-id:<revision>" marker that build_info.cpp embeds).  ""
+// when the file cannot be read or holds no marker.
+//
+// The marker literal of *this* build is only one of its occurrences in a file:
+// every build also contains the bare prefix, and the linker is free to place it
+// first.  A candidate is therefore accepted only when it looks like a revision
+// and is terminated by the NUL that closes the string constant.
+std::string file_build_id(const std::string & bytes) {
+    const std::string prefix = build_marker_prefix();
+    if (prefix.empty()) return std::string();
+    size_t at = bytes.find(prefix, 0);
+    while (at != std::string::npos) {
+        const size_t begin = at + prefix.size();
+        size_t end = begin;
+        while (end < bytes.size()) {
+            const unsigned char c = static_cast<unsigned char>(bytes[end]);
+            const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                            (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-';
+            if (!ok) break;
+            ++end;
+        }
+        if (end > begin && end < bytes.size() && bytes[end] == '\0' &&
+            end - begin <= 64) {
+            return bytes.substr(begin, end - begin);
+        }
+        at = bytes.find(prefix, at + 1);
+    }
+    return std::string();
 }
 
 fs::path install_dir_path() {
@@ -263,7 +300,7 @@ bool copy_atomic(const fs::path & src, const fs::path & dst, std::string * err) 
         const DWORD code = GetLastError();
         set_error(err, "не удалось заменить " + path_str(dst) +
                            (code == ERROR_ACCESS_DENIED || code == ERROR_SHARING_VIOLATION
-                                ? " (файл занят или уже запущен)"
+                                ? " (файл занят: закройте запущенную копию приложения и повторите)"
                                 : "") +
                            " [код " + std::to_string(static_cast<unsigned long>(code)) + "]");
 #else
@@ -489,24 +526,29 @@ InstallStatus install_status() {
         st.autostart = is_autostart_enabled();
 
         if (st.installed) {
-            std::error_code ec;
-            const uintmax_t a = fs::file_size(install_exe_path(), ec);
-            ec.clear();
-            const uintmax_t b = fs::file_size(self, ec);
-            if (!ec && a == b) {
-                // An unreadable file yields an empty digest: never treat that as
-                // "the same build".
-                const std::string da = file_digest(self);
-                const std::string db = file_digest(install_exe_path());
-                st.up_to_date = !da.empty() && da == db;
+            // Both files are read once: the installed copy for its revision
+            // marker, this process for the "identical build" comparison.
+            std::string installed_bytes;
+            if (read_file_bytes(install_exe_path(), &installed_bytes)) {
+                st.installed_build_id = file_build_id(installed_bytes);
+                std::string self_bytes;
+                if (read_file_bytes(self, &self_bytes) && !self_bytes.empty()) {
+                    st.up_to_date = util::sha256_hex(self_bytes) == util::sha256_hex(installed_bytes);
+                }
             }
         }
 
         // Human readable notes, most important first.
         if (st.running_installed) {
             st.detail = "приложение запущено из каталога установки";
+        } else if (install_update_pending(st)) {
+            st.detail = "установленная копия — сборка " +
+                        (st.installed_build_id.empty() ? std::string("без метки")
+                                                       : st.installed_build_id) +
+                        ", запущена " + build_id() + " — обновите её";
         } else if (st.installed && !st.up_to_date) {
-            st.detail = "установленная копия устарела — выполните --install";
+            st.detail = "установленная копия — та же сборка " + std::string(build_id()) +
+                        ", но файл отличается (пересборка): обновлять не обязательно";
         }
 #if !defined(_WIN32)
         if (!st.running_installed && !st.install_dir.empty() && !dir_on_path(st.install_dir)) {
@@ -695,12 +737,29 @@ bool set_autostart(bool on, std::string * err) {
     }
 }
 
+bool install_update_pending(const InstallStatus & st) {
+    if (!st.installed || st.running_installed) return false;
+    if (st.up_to_date) return false;  // byte for byte the same file
+    // A copy without a readable marker (an old installation, or an executable
+    // replaced by hand) counts as another build: offering an update is the only
+    // way to get a marker into it.
+    return st.installed_build_id != build_id();
+}
+
 bool should_offer_install() {
     try {
-        if (install_status().running_installed) return false;
+        const InstallStatus st = install_status();
+        if (st.running_installed) return false;  // nothing to install or update
+        if (st.installed) {
+            if (st.up_to_date) return false;                       // the same file
+            if (!install_update_pending(st)) return false;         // the same revision, rebuilt
+        }
+        // The prompt has to be answered once per build: a new source revision
+        // asks again, the same one stays quiet no matter how often it is run.
         nlohmann::json j;
         if (!read_install_json(&j)) return true;  // no flag file yet: never asked
-        return !j.value("prompt_shown", false);
+        if (!j.value("prompt_shown", false)) return true;
+        return j.value("prompt_build_id", std::string()) != build_id();
     } catch (...) {
         return false;
     }
@@ -711,6 +770,7 @@ void mark_install_prompt_shown() {
         nlohmann::json j;
         read_install_json(&j);  // preserves any other keys already stored
         j["prompt_shown"] = true;
+        j["prompt_build_id"] = build_id();
         write_install_json(j);
     } catch (...) {
         // Best effort.

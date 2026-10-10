@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "app/build_info.h"
 #include "app/controller.h"
 #include "app/install.h"
 #include "app/models.h"
@@ -119,6 +120,7 @@ bool parse_args(const std::vector<std::string> & args, Args * a) {
 
 int cmd_info() {
     std::printf("npa_asr %s\n", ASR_VERSION);
+    std::printf("build   : %s\n", build_id());
     std::printf("os      : %s\n", platform::os_name().c_str());
     std::printf("cpu     : %s\n", platform::cpu_brand().c_str());
     std::printf("threads : %u\n", std::thread::hardware_concurrency());
@@ -321,7 +323,7 @@ int cmd_install(const Args & a) {
         return 1;
     }
     const InstallStatus st = install_status();
-    std::printf("установлено: %s\n", st.install_exe.c_str());
+    std::printf("установлено: %s (сборка %s)\n", st.install_exe.c_str(), build_id());
     if (want_autostart) {
         std::printf("автозапуск включён: %s\n", st.autostart_target.c_str());
     } else {
@@ -357,10 +359,17 @@ int cmd_set_autostart(bool on) {
 int cmd_install_status() {
     const InstallStatus st = install_status();
     std::printf("исполняемый файл      : %s\n", st.exe_path.c_str());
+    std::printf("сборка запущенного    : %s\n", build_id());
     std::printf("каталог установки     : %s\n", st.install_dir.c_str());
     std::printf("установлено           : %s\n", st.installed ? "да" : "нет");
+    std::printf("сборка установленной  : %s\n",
+                !st.installed ? "-"
+                              : (st.installed_build_id.empty() ? "(без метки)"
+                                                               : st.installed_build_id.c_str()));
     std::printf("копия актуальна       : %s\n",
                 !st.installed ? "-" : (st.up_to_date ? "да" : "нет"));
+    std::printf("нужно обновление      : %s\n", install_update_pending(st) ? "да" : "нет");
+    std::printf("предложить установку  : %s\n", should_offer_install() ? "да" : "нет");
     std::printf("автозапуск            : %s\n", st.autostart ? "включён" : "выключен");
     std::printf("запущено из установки : %s\n", st.running_installed ? "да" : "нет");
     std::printf("точка автозапуска     : %s\n", st.autostart_target.c_str());

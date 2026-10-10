@@ -27,8 +27,17 @@ struct InstallStatus {
     std::string install_exe;         // <install_dir>/npa_asr[.exe]
     std::string exe_path;            // executable of the running process
     std::string autostart_target;    // registry value / .desktop file path
+    // Source revision of the installed copy, read out of that file (see
+    // build_info.h).  Empty when there is no copy or it carries no marker - for
+    // instance when it was installed by a build that predates the marker.
+    std::string installed_build_id;
     std::string detail;              // human readable extra info (may be empty)
 };
+
+// True when the installed copy comes from a different source revision than this
+// process: exactly the case the application offers an update for.  A rebuilt
+// copy of the *same* revision is not an update (only its bytes differ).
+bool install_update_pending(const InstallStatus & st);
 
 // Never fails; an unreadable state simply reports false flags.
 InstallStatus install_status();
@@ -49,9 +58,11 @@ bool set_autostart(bool on, std::string * err);
 // The command line the autostart entry uses (exposed for tests/diagnostics).
 std::string autostart_command();
 
-// The application should offer the "install" prompt exactly once: the flag is
-// stored in <user_data_dir>/install.json, and the prompt is not offered at all
-// when the process already runs from the install directory.
+// The install prompt is offered when this build has not answered it yet: once
+// when the application is not installed at all, and once per new source
+// revision afterwards (so a new build - but not a rebuild of the same commit -
+// offers to update the installed copy).  The answer is remembered per build in
+// <user_data_dir>/install.json, together with the revision that gave it.
 bool should_offer_install();
 void mark_install_prompt_shown();
 
