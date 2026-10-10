@@ -1,0 +1,65 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libx11-dev libxtst-dev libgl1-mesa-dev libcurl4-openssl-dev
+
+      - name: Configure and build (runtime CPU dispatch, fallback included)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j "$(nproc)"
+
+      - name: Smoke test
+        run: |
+          ./build/bin/npa_asr --help
+          ./build/bin/npa_asr --info
+          ./build/bin/npa_asr --list-models || true
+
+      - name: Upload the Linux bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: npa_asr-linux-x86_64
+          path: |
+            build/bin/npa_asr
+            build/bin/*.so*
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure and build (MSVC + Ninja)
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" 2>nul || call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" 2>nul || call "%ProgramFiles%\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+
+      - name: Smoke test
+        shell: cmd
+        run: |
+          build\bin\npa_asr.exe --help
+          build\bin\npa_asr.exe --info
+
+      - name: Upload the Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: npa_asr-windows-x86_64
+          path: |
+            build/bin/npa_asr.exe
+            build/bin/*.dll

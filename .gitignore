@@ -66,3 +66,25 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# --- npa_asr ---
+# build trees
+build-linux/
+build-windows/
+build/
+# downloaded / fetched dependencies
+third_party/ggml/
+third_party/imgui/
+third_party/glfw/
+third_party/_fetched/
+third_party/miniaudio.h
+third_party/json.hpp
+third_party/whisper.cpp/
+# local models, reference material and tooling caches
+models/*
+!models/manifest.json
+.ref/
+.venv/
+.uv-cache/
+logs/
+*.gguf
