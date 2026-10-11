@@ -84,7 +84,11 @@ jobs:
 
       # The version baked into the binary comes from the tag, so a release can
       # never ship a binary that reports a different version than its name.
+      # bash on both platforms: the continuation lines below are bash syntax, and
+      # the default shell on the Windows runners is pwsh, which reads a trailing
+      # backslash as a literal argument and then fails on the next line.
       - name: Configure
+        shell: bash
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
