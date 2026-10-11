@@ -94,7 +94,9 @@ std::unique_ptr<TrayIcon> create_tray_icon();
 
 // RGBA pixels (size * size * 4, top-down) of the application icon.  Used for
 // the window/taskbar icon by the GUI and by the tray backends, so the icon is
-// drawn in code and the repository carries no binary asset.
+// drawn in code and the repository carries no binary asset; the Windows
+// executable icon is rendered from the same function at build time by
+// tools/make_icon.cpp.
 bool app_icon_rgba(int size, std::vector<unsigned char> * out);
 
 // ------------------------------------------------------------------ misc

@@ -1683,6 +1683,12 @@ int run_gui(bool minimized) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 #endif
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    // Created hidden and shown further down, once the icon is in place: the
+    // taskbar button is built when the window first becomes visible, so a window
+    // that glfwCreateWindow() shows by itself would keep the generic GLFW icon
+    // until it is hidden and shown again (which is what "the icon only appears
+    // after the first trip to the tray" was).
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
 
     // The revision in the title bar makes it obvious which build is on screen.
     const std::string window_title =
@@ -1700,15 +1706,25 @@ int run_gui(bool minimized) {
     glfwSwapInterval(1);  // vsync: the main loop runs at the display rate (~60 FPS)
     {
         // The same icon the tray uses, so the taskbar/Alt-Tab entry is not the
-        // generic GLFW one.
-        std::vector<unsigned char> icon_px;
-        if (platform::app_icon_rgba(32, &icon_px)) {
-            GLFWimage image;
-            image.width = 32;
-            image.height = 32;
-            image.pixels = icon_px.data();
-            glfwSetWindowIcon(window, 1, &image);
+        // generic GLFW one.  Both shell sizes are supplied: 16 px is the title
+        // bar and the notification area, 32 px the taskbar and Alt-Tab.
+        std::vector<unsigned char> icon_16;
+        std::vector<unsigned char> icon_32;
+        GLFWimage images[2];
+        int image_count = 0;
+        if (platform::app_icon_rgba(16, &icon_16)) {
+            images[image_count].width = 16;
+            images[image_count].height = 16;
+            images[image_count].pixels = icon_16.data();
+            ++image_count;
         }
+        if (platform::app_icon_rgba(32, &icon_32)) {
+            images[image_count].width = 32;
+            images[image_count].height = 32;
+            images[image_count].pixels = icon_32.data();
+            ++image_count;
+        }
+        if (image_count > 0) glfwSetWindowIcon(window, image_count, images);
     }
     // Size limits are in screen coordinates, i.e. physical pixels on a scaled
     // display, so they have to be scaled as well.
@@ -1802,7 +1818,10 @@ int run_gui(bool minimized) {
         }
     }
 
-    if (minimized) glfwIconifyWindow(window);  // the autostart entry starts this way
+    // First show, with the window icon already registered (see the
+    // GLFW_VISIBLE hint above).  The autostart entry starts minimised.
+    glfwShowWindow(window);
+    if (minimized) glfwIconifyWindow(window);
 
     while (!glfwWindowShouldClose(window) && !ui.quit_requested) {
         const bool visible = glfwGetWindowAttrib(window, GLFW_VISIBLE) != GLFW_FALSE;

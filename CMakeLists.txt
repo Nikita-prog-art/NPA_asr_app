@@ -190,6 +190,16 @@ target_include_directories(asr_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 
+if(MSVC)
+  # The sources are UTF-8 without a BOM.  Without /utf-8 the compiler reads them
+  # in the system code page, which silently mangles every *wide* literal: the
+  # tray menu came out as "Îòêðûòü îêíî" instead of "Открыть окно" (narrow
+  # literals survived because UTF-8 bytes round-trip through the code page).
+  # /utf-8 also pins the execution character set to UTF-8, which is what ImGui
+  # expects for the Russian labels and the recognised text.
+  target_compile_options(asr_core PUBLIC /utf-8)
+endif()
+
 # The revision is a generated header rather than a target-wide definition so
 # that a new commit recompiles src/app/build_info.cpp only.  configure_file()
 # leaves the file (and therefore the build) alone while the value is unchanged.
@@ -270,21 +280,55 @@ endif()
 if(WIN32)
   # shell32: Shell_NotifyIcon (the notification-area icon in platform_win.cpp)
   target_link_libraries(npa_asr PRIVATE winhttp shlwapi shell32 ws2_32)
+  enable_language(RC)
+
+  # Explorer, the taskbar and Alt-Tab read the application icon from a resource
+  # inside the .exe, and a resource has to be a file.  npa_icon renders the icon
+  # the code draws (src/platform/app_icon.cpp) into a multi-size .ico at build
+  # time, so the repository still carries no binary asset and the .ico cannot
+  # drift away from the icon the window and the tray use.
+  add_executable(npa_icon tools/make_icon.cpp src/platform/app_icon.cpp)
+  target_include_directories(npa_icon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  set_target_properties(npa_icon PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/icon
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_BINARY_DIR}/icon
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/icon)
+  set(ASR_APP_ICON ${CMAKE_BINARY_DIR}/icon/npa_asr.ico)
+  add_custom_command(OUTPUT ${ASR_APP_ICON}
+    COMMAND $<TARGET_FILE:npa_icon> ${ASR_APP_ICON}
+    DEPENDS npa_icon
+    COMMENT "Generating the application icon")
+  add_custom_target(npa_icon_file DEPENDS ${ASR_APP_ICON})
+  add_dependencies(npa_asr npa_icon_file)
+
+  # The resource compiler resolves relative paths against its own working
+  # directory, so the .rc gets absolute ones.
+  file(TO_NATIVE_PATH "${ASR_APP_ICON}" ASR_APP_ICON_RC)
+  string(REPLACE "\\" "\\\\" ASR_APP_ICON_RC "${ASR_APP_ICON_RC}")
+
   # Application manifest: Per-Monitor-V2 DPI awareness (a statically linked GLFW
   # cannot carry its own manifest), long path support, asInvoker.
   if(MSVC)
     # The linker already emits a default manifest (/MANIFEST:EMBED,ID=1), so ours
     # is merged into it with /MANIFESTINPUT.  Adding it as a resource instead
-    # fails with CVT1100 "duplicate resource, type MANIFEST, name 1".
+    # fails with CVT1100 "duplicate resource, type MANIFEST, name 1", hence the
+    # empty manifest line in the .rc below.
+    set(ASR_RC_MANIFEST "")
     target_link_options(npa_asr PRIVATE
       "/MANIFEST:EMBED"
       "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.manifest")
   else()
     # MinGW and friends: windres embeds it as resource id 1.
-    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.rc.in
-                   ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc @ONLY)
-    target_sources(npa_asr PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc)
+    set(ASR_RC_MANIFEST "1 24 \"${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.manifest\"")
   endif()
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/npa_asr.rc.in
+                 ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc @ONLY)
+  target_sources(npa_asr PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc)
+  # add_dependencies() orders whole targets; a parallel build could still reach
+  # the RC step of npa_asr before the generator has written the .ico, so the
+  # dependency is attached to that one source file as well.
+  set_property(SOURCE ${CMAKE_CURRENT_BINARY_DIR}/npa_asr.rc
+               PROPERTY OBJECT_DEPENDS ${ASR_APP_ICON})
 endif()
 
 set_target_properties(npa_asr PROPERTIES
