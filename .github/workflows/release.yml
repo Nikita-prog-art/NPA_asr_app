@@ -155,6 +155,11 @@ jobs:
           version="${RELEASE_TAG#v}"
           mkdir -p dist
           cp build/bin/npa_asr "dist/npa_asr-${version}-${{ matrix.suffix }}"
+          # The application reads the model catalogue from
+          # releases/latest/download/manifest.json (src/net/manifest.cpp), and
+          # after this release "latest" is the application, not the models
+          # release - so the catalogue travels with it.
+          cp models/manifest.json dist/manifest.json
           ls -l dist
 
       - name: Stage the release asset
